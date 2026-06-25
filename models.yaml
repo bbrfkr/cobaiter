@@ -1,0 +1,57 @@
+# cobaiter model registry (externally injected, hand-managed).
+#
+# Maps each downstream LiteLLM model name to its routing capabilities + policy.
+# This file is the SOURCE OF TRUTH: on startup cobaiter reconciles the registry
+# to match it exactly (models not listed here are removed).
+#
+# Fields per model:
+#   model           : the exact model name as exposed by LiteLLM (/v1/models)
+#   tier            : routing class — "rich" (strong) / "light" (fast) / "openweight"
+#   description     : free-text use-case ("what this model is best for"); shown to
+#                     the classifier so it can match the conversation to a model
+#   context_window  : max input tokens (used by the hard-constraint filter)
+#   multimodal      : true if it accepts images
+#   supports_tools  : true if it supports function/tool calling
+#   is_local        : true if served locally / privacy-safe
+#   fallback_chain  : ordered failover targets when this model is unavailable
+#
+# NOTE: capability values below are starting points — tune them to your backends.
+# The classifier model (COBAITER_CLASSIFIER_MODEL) is NOT a routable target and is
+# intentionally omitted here.
+
+models:
+  - model: bbrfkr-llm-general
+    tier: rich
+    description: "汎用の対話・推論・文章作成・要約・翻訳など、コーディング以外の幅広い用途に最適。複雑な推論やニュアンスのある執筆もこなす。"
+    context_window: 262144
+    multimodal: true
+    supports_tools: true
+    is_local: true
+    fallback_chain: [bbrfkr-llm-general-no-think]
+
+  - model: bbrfkr-llm-general-no-think
+    tier: light
+    description: "汎用用途の軽量・高速版。短い質問・事実確認・単純な対話など、深い推論を要しない用途向け。"
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: true
+    fallback_chain: []
+
+  - model: bbrfkr-llm-coding
+    tier: rich
+    description: "コード生成・リファクタリング・デバッグ・技術設計に最適化。長いコードや複数ファイル横断の開発作業向け。"
+    context_window: 262144
+    multimodal: true
+    supports_tools: true
+    is_local: true
+    fallback_chain: [bbrfkr-llm-coding-no-think, bbrfkr-llm-general]
+
+  - model: bbrfkr-llm-coding-no-think
+    tier: light
+    description: "コーディング用途の軽量・高速版。短いスニペット生成や単純な修正など、深い推論を要しないコード作業向け。"
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: true
+    fallback_chain: [bbrfkr-llm-general-no-think]

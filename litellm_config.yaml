@@ -1,0 +1,35 @@
+# Sample LiteLLM gateway config used by docker-compose.
+# Map the model names in cobaiter's registry to real providers, and (optionally)
+# attach budgets so cobaiter can read credit headroom from /model/info.
+#
+# Docs: https://docs.litellm.ai/docs/proxy/configs
+model_list:
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: anthropic/claude-opus-4-8
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      max_budget: 50.0      # USD; cobaiter reads (max_budget - spend) as headroom
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      max_budget: 50.0
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: qwen2.5
+    litellm_params:
+      model: ollama/qwen2.5
+      api_base: http://host.docker.internal:11434
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/COBAITER_LITELLM_API_KEY

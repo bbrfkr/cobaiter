@@ -1,0 +1,41 @@
+[project]
+name = "cobaiter"
+version = "0.1.0"
+description = "Context Based LLM Router - conversation-sticky, capability-aware OpenAI-compatible proxy in front of LiteLLM"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "redis>=5.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "tiktoken>=0.7",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+cobaiter = "cobaiter.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "fakeredis>=2.23",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cobaiter"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.testclient",
+]

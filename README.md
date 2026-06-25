@@ -1,0 +1,205 @@
+# cobaiter — Context Based LLM Router
+
+`cobaiter` は、AI エージェントと LLM ゲートウェイ（**LiteLLM** 前提）の間に立つ
+**OpenAI 互換プロキシ**です。呼び出し側はどのモデルが使われるかを意識せず、仮想モデル名
+`cobaiter-auto` に投げるだけ。cobaiter が会話のコンテキストを見て最適なモデルを自動選択し、
+**1 つの会話では基本同じモデルに固定**して回答の一貫性を保ちます（会話が違えば違う AI と話す体験）。
+
+設計図の③「コンテキストベース LLM ルーティング」に相当します。
+
+## 特徴
+
+- **モデル非依存の自動選択**: エージェントは `cobaiter-auto` を呼ぶだけ。
+- **会話スティッキー**: 会話ごとにモデルを固定（`route: pinned`）。一貫性を担保。
+- **ハイブリッド判定**: ハード制約フィルタ（モデルレジストリ）で候補を絞り、複数残るときだけ
+  軽量分類モデルで 1 つを選択。決定的なら分類器を呼ばない。
+- **ヒステリシス付き再ルーティング**: 文脈が実質的に変化したら会話途中でも切替（`route: context-switch`）。
+  `min_dwell_turns` と `switch_margin` で過剰なフラッピングを抑制。
+- **フェイルオーバー**: コンテキスト長超過 / レート制限 / クォータ枯渇 / 障害を検出し、
+  フォールバックチェーンの次段へ切替（`route: failover`）。切替は単方向（元へ戻さない）。
+- **永続化**: 会話状態・モデルレジストリを **Valkey**（AOF）に保存。
+
+## アーキテクチャ
+
+```
+AIエージェント ──(cobaiter-auto, OpenAI互換)──▶ cobaiter ──(具体モデル名)──▶ LiteLLM ──▶ Claude / GLM / Ollama ...
+                                                  │                               ▲
+                ┌─────────────────────────────────┼──────────────┐               │ budget/spend 参照
+   会話状態(Valkey)            モデルレジストリ(Valkey)        軽量分類モデル        │ (クレジット余力)
+   conv:<key>→{model,...}     capabilities/窓/tier/          (LiteLLM経由)─────────┘
+                              fallback_chain                 ※複数候補時だけ
+```
+
+### ルーティング判定（ユーザーターン単位の統合フロー）
+
+1. 会話キーを決定（明示 ID → `metadata.conversation_id` → `user` → 会話先頭の指紋）。
+2. **ユーザーターン境界かどうかを判定**: リクエスト中の `user` ロールメッセージ数が前回判定時より
+   増えていれば「新しいユーザーターン」、そうでなければ「1 指示の途中（エージェントのツール往復・再送）」。
+   - **指示の途中**: 原則 `pinned` で固定（ソフト再評価・文脈スイッチは行わない）。固定モデルが
+     制約違反/不可用/クレジット枯渇になった場合のみ強制 `failover`（留まる選択肢がないため）。
+   - これにより、**エージェントが 1 指示で何十回も API を叩いても、その指示の中ではモデルが切り替わらない**。
+3. ハード制約を再計算（画像/ツール/プライバシー/トークン数 vs 窓）＋各モデルの可用性・クレジット余力。
+4. **継続会話（新しいユーザーターン）**: 固定モデルが有効なら `pinned`。制約違反/不可用/クレジット枯渇なら即 `failover`。
+   実質的な文脈変化があれば（2 段ゲート: 安価トリガ→再分類→マージン判定）`context-switch`。
+5. **新規会話**: 制約フィルタ後、候補 1 つなら `rule`、複数なら分類モデルで `classifier-select`、0 なら `default`。
+
+> **ターンの定義**: ヒステリシス（`min_dwell_turns` / `soft_recheck_every`）が数える「ターン」は
+> **ユーザーの発話 1 回**であり、ダウンストリームの API コール回数ではありません。エージェンティック
+> ループのツール往復はターンを消費しないため、ドウェル／再評価の窓が指示途中で空回りしません。
+
+詳細は実装計画（`~/.claude/plans/…`）を参照。
+
+## クイックスタート（Docker Compose）
+
+```bash
+cp .env.example .env
+# .env と litellm_config.yaml を編集（ANTHROPIC_API_KEY などを設定）
+export ANTHROPIC_API_KEY=sk-...
+docker compose up -d            # valkey + litellm + cobaiter
+curl localhost:8000/healthz
+```
+
+### ローカル開発（Valkey のみコンテナ）
+
+```bash
+uv sync
+docker compose up -d valkey
+COBAITER_VALKEY_URL=redis://localhost:6379/0 uv run python -m cobaiter
+```
+
+## 使い方
+
+### モデルレジストリ（設定ファイルで外部注入）
+
+どのモデルをどの `tier`／能力／フォールバックに分類するかは、**外部の設定ファイルで手動管理**します
+（ハードコードしません）。パスは `COBAITER_MODELS_CONFIG`（既定では未指定＝内蔵デフォルト）で指定し、
+compose では `models.yaml` をコンテナにマウントします。**このファイルが真実の源**で、起動時にレジストリは
+ファイルの内容ちょうどに同期されます（ファイルに無いモデルは削除）。
+
+```yaml
+# models.yaml
+models:
+  - model: bbrfkr-llm-general          # LiteLLM が公開する実モデル名
+    tier: rich                         # rich / light / openweight
+    description: 汎用の対話・推論・文章作成向け  # このモデルの用途（分類器に渡る）
+    context_window: 262144
+    multimodal: true
+    supports_tools: true
+    is_local: true
+    fallback_chain: [bbrfkr-llm-general-no-think]
+  # ... 以降、運用するモデルを列挙
+```
+
+`description` は各モデルの**用途を表す自由文**で、分類器のカタログにそのまま渡されます。会話の実際の用途と
+`description` を照合してモデルを選ぶため、`tier`（能力ラベル）とは別に「何向けのモデルか」を伝えられます。
+
+実行中の一時的な上書きは `PUT /admin/models` でも可能ですが、再起動すると設定ファイルに再同期されます。
+能力値（窓・マルチモーダル・ツール対応）はバックエンドに合わせて手動調整してください
+（LiteLLM 側に未設定なことが多いため）。分類用モデル（`COBAITER_CLASSIFIER_MODEL`）はルーティング対象外なので
+レジストリには含めません。
+
+### チャット（OpenAI 互換）
+
+```bash
+curl -s -D- localhost:8000/v1/chat/completions \
+  -H 'x-cobaiter-conversation-id: conv-123' \
+  -d '{"model":"cobaiter-auto","messages":[{"role":"user","content":"こんにちは"}]}'
+# レスポンスヘッダ:
+#   x-cobaiter-model: 実際に使われたモデル
+#   x-cobaiter-route: pinned|rule|classifier-select|context-switch|failover|default
+#   x-cobaiter-conversation: 会話キー
+```
+
+会話の固定状態は `GET /admin/conversations/<key>` で確認、`DELETE` でリセットできます。
+
+## エンドポイント
+
+| Method | Path | 説明 |
+| --- | --- | --- |
+| POST | `/v1/chat/completions` | メイン。ルーティングして LiteLLM へ中継 |
+| GET | `/v1/models` | 仮想モデル＋レジストリのモデル一覧 |
+| GET | `/healthz` | ヘルスチェック（Valkey 接続含む） |
+| GET/PUT | `/admin/models` | レジストリ一覧 / 追加・更新 |
+| DELETE | `/admin/models/{model}` | レジストリ削除 |
+| GET/DELETE | `/admin/conversations/{key}` | 会話束縛の確認 / リセット |
+
+## 設定（環境変数）
+
+すべての設定は環境変数（接頭辞 `COBAITER_`）または `.env` で与えます。雛形は `.env.example` を参照。
+以下が全項目です（既定値は `cobaiter/config.py`）。
+
+### ダウンストリーム LiteLLM ゲートウェイ
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_LITELLM_BASE_URL` | `http://localhost:4000` | 中継先 LiteLLM のベース URL |
+| `COBAITER_LITELLM_API_KEY` | （空） | LiteLLM 呼び出し用 API キー（master key 等） |
+
+### Valkey（会話状態・モデルレジストリの永続化）
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_VALKEY_URL` | `redis://localhost:6379/0` | Valkey/Redis 接続 URL。到達不能時は状態系 API が 503 |
+
+### モデルレジストリ
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_MODELS_CONFIG` | （空） | 外部レジストリファイル（YAML/JSON）のパス。**空＝内蔵デフォルトシード**。指定時は起動毎にこのファイルへ完全同期（未記載モデルは削除） |
+
+### ルーティング
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_VIRTUAL_MODEL` | `cobaiter-auto` | エージェントが呼ぶ仮想モデル名。これ宛のリクエストをルーティング対象とする |
+| `COBAITER_CLASSIFIER_MODEL` | `claude-haiku-4-5` | 候補が複数残るときだけ使う軽量分類モデル。**レジストリには含めない**（ルーティング対象外） |
+| `COBAITER_CLASSIFIER_MAX_TOKENS` | `2048` | 分類呼び出しの最大出力トークン。"thinking" 型分類モデルが思考＋JSON を出し切れるよう確保（小さすぎると JSON が切れてヒューリスティックへ退避） |
+| `COBAITER_DEFAULT_MODEL` | `claude-haiku-4-5` | どの候補も制約を満たさないときの安全なフォールバック先 |
+
+### 会話スティッキー / ヒステリシス
+
+「ターン」は**ユーザーの発話 1 回**で数えます（API コール回数ではない。前述の「ターンの定義」参照）。
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_CONV_TTL_SECONDS` | `604800`（7 日） | 会話束縛（固定モデル等）を Valkey に保持する TTL |
+| `COBAITER_MIN_DWELL_TURNS` | `3` | ソフト切替（品質駆動の `context-switch`）を許すまで現モデルに留まる最小ユーザーターン数。フラッピング抑制 |
+| `COBAITER_SWITCH_MARGIN` | `0.15` | 切替に必要な「最良候補スコア − 固定モデルスコア」の優位差。小さいほど切り替わりやすい |
+| `COBAITER_SOFT_RECHECK_EVERY` | `4` | 変化トリガが無くても N ユーザーターン毎に分類器で定期再評価する周期 |
+| `COBAITER_SCORE_EMA_ALPHA` | `0.5` | 固定モデルスコアの EMA 平滑係数（0..1、大きいほど直近に反応） |
+
+### クレジット / 可用性（LiteLLM の budget/spend を参照）
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_CREDIT_FLOOR` | `0.0` | 残クレジット余力（USD）がこの値を下回るモデルは不可用として候補から除外 |
+| `COBAITER_CREDIT_CACHE_TTL` | `30` | LiteLLM の budget/spend 参照結果のキャッシュ TTL（秒） |
+
+### HTTP サーバ / クライアント
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_HOST` | `0.0.0.0` | 待ち受けホスト |
+| `COBAITER_PORT` | `8000` | 待ち受けポート |
+| `COBAITER_REQUEST_TIMEOUT` | `600.0` | ダウンストリーム HTTP リクエストのタイムアウト（秒） |
+
+## テスト
+
+```bash
+uv run pytest
+```
+
+## 留意点
+
+- クレジット余力・予算・spend は LiteLLM に委譲（cobaiter は参照のみ）。
+- LiteLLM 自体のサイレントなフォールバックは使わず、使用モデルは常に cobaiter が決定する。
+- ストリーミングはストリーム**開始前**の失敗のみ自動フェイルオーバー。開始後の失敗は伝播。
+- **1 つのユーザー指示の途中ではモデルを切り替えない**。ユーザーターン境界（新しい `user` メッセージ）でのみ
+  品質駆動の再ルーティング（`context-switch`）を検討し、指示途中のツール往復は固定したまま。例外は強制
+  フェイルオーバーのみ（可用性・制約違反は留まれないため切替）。
+- 依存障害は 500 にせず明示化: **LiteLLM 到達不能 → 502**、**Valkey（状態ストア）到達不能 → 503**。
+  `/healthz` は Valkey 障害時 `degraded` を返す。
+- 分類モデルが "thinking" 型でも動作するよう、`COBAITER_CLASSIFIER_MAX_TOKENS`（既定 2048）で思考＋JSON の
+  出力長を確保し、`content` が空なら `reasoning_content` からも JSON を回収する。分類が失敗した場合は
+  tier ベースのヒューリスティックへ安全にフォールバックし、ログに分類モデル名・スコア・採否を出力する。
+- API キー等の機密は `.env` で管理し、ログ・レスポンスに出さない。

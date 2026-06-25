@@ -1,0 +1,46 @@
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    # AOF persistence so the mapping table / conversation bindings survive restarts.
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # litellm:
+  #   image: ghcr.io/berriai/litellm:main-latest
+  #   # Provide your own config.yaml with model_list + budgets. See README.
+  #   command: ["--config", "/app/litellm_config.yaml", "--port", "4000"]
+  #   volumes:
+  #     - ./litellm_config.yaml:/app/litellm_config.yaml:ro
+  #   env_file:
+  #     - .env
+  #   ports:
+  #     - "4000:4000"
+
+  cobaiter:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      # Externally-managed model registry (hand-tuned mapping of model -> tier/caps).
+      - ./models.yaml:/app/models.yaml:ro
+    environment:
+      # Valkey runs as a compose service; override only the in-cluster hostname.
+      # COBAITER_LITELLM_BASE_URL is intentionally NOT set here so the value from
+      # .env (the real LiteLLM gateway) is used.
+      COBAITER_VALKEY_URL: redis://valkey:6379/0
+    depends_on:
+      valkey:
+        condition: service_healthy
+    ports:
+      - "8080:8000"
+
+volumes:
+  valkey-data:
