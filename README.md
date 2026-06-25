@@ -1,4 +1,4 @@
-# cobaiter — Context Based LLM Router
+# cobaiter — Context Based AI Router
 
 `cobaiter` は、AI エージェントと LLM ゲートウェイ（**LiteLLM** 前提）の間に立つ
 **OpenAI 互換プロキシ**です。呼び出し側はどのモデルが使われるかを意識せず、仮想モデル名
