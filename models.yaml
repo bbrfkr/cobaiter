@@ -38,6 +38,16 @@
 # target and is intentionally omitted here.
 
 models:
+  - model: gpt-5.5
+    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    cost: 5
+    tier: 6
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: false
+    fallback_chain: [bbrfkr-llm-general]
+
   - model: bbrfkr-llm-general
     description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
     cost: 0
@@ -62,16 +72,6 @@ models:
     description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
     cost: 5
     tier: 6
-    context_window: 262144
-    multimodal: false
-    supports_tools: true
-    is_local: false
-    fallback_chain: [bbrfkr-llm-coding]
-
-  - model: claude-sonnet-4-6
-    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
-    cost: 3
-    tier: 4
     context_window: 262144
     multimodal: false
     supports_tools: true
