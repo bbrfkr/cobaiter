@@ -65,14 +65,7 @@ def extract_constraints(
         needs_tools=bool(req.tools or req.functions),
         needs_local=_needs_privacy(req, privacy_header),
         estimated_tokens=estimate_tokens(req.messages),
-        tier_hint=_tier_hint(req),
     )
-
-
-def _tier_hint(req: ChatCompletionRequest) -> str | None:
-    if req.metadata and isinstance(req.metadata.get("tier"), str):
-        return req.metadata["tier"]
-    return None
 
 
 def _needs_privacy(req: ChatCompletionRequest, privacy_header: str | None) -> bool:

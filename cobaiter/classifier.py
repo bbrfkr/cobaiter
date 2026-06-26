@@ -25,24 +25,35 @@ from .schemas import (
 
 log = logging.getLogger("cobaiter")
 
+# The classifier judges only *semantics* — it does NOT emit the final calibrated
+# score. It returns (a) one task-difficulty scalar and (b) a per-candidate use-case
+# relevance; the router turns those into a suitability via tier-vs-difficulty
+# capability-fit. Splitting the work this way keeps each LLM judgement simple (a
+# relative call it is good at) and moves the float arithmetic into reproducible
+# code, so scores spread across 0..1 instead of collapsing to {0, 1}. Cost and
+# tier are deliberately NOT shown — relevance must stay capability/price neutral.
 _SYSTEM = (
-    "You are a cost-aware routing classifier. Given a conversation and a list of "
-    "candidate LLMs (each with a capability tier and a free-text description of what "
-    "it is best suited for), score how appropriate each candidate is for handling "
-    "this conversation, from 0.0 (poor) to 1.0 (ideal). Goal: pick the CHEAPEST model "
-    "that is clearly SUFFICIENT for the task — do NOT reward raw capability. "
-    "First match the conversation's actual use-case to each candidate's description; "
-    "a model whose described purpose does not fit must score low regardless of tier. "
-    "Among models that fit the use-case, prefer lighter (cheaper, faster) tiers and "
-    "give them the HIGHEST score whenever they are sufficient. Reserve higher scores "
-    "for a stronger (rich) tier only when the task CLEARLY demands it — genuinely hard "
-    "reasoning, long or complex multi-file coding, or nuanced long-form writing. "
-    "For simple, short, factual, or casual exchanges (e.g. greetings, one-line "
-    "questions), a light model must outscore the rich model. When two tiers are "
-    "otherwise equally suitable, break the tie in favor of the lighter (cheaper) one. "
-    "Respond ONLY with compact JSON: "
-    "{\"scores\":[{\"model\":\"<name>\",\"score\":<float>}, ...]} "
-    "covering exactly the candidate models."
+    "You assess a user's task against candidate models. Each candidate has only a "
+    "`description` (what it is for) and an opaque `model` id — judge ONLY by the "
+    "description; the id is meaningless. Ignore cost, speed, and capability — those "
+    "are handled elsewhere.\n"
+    "Return TWO things as JSON:\n"
+    "1. `difficulty`: ONE number 0.0-1.0 for the whole task — how much skill and "
+    "depth of reasoning it demands. 0.0 = trivial (greeting, simple lookup), 0.5 = "
+    "moderate, 1.0 = very hard (deep/expert reasoning). Judge from what is asked, "
+    "not from message length.\n"
+    "2. `relevance` per candidate: 0.0-1.0 for how well the candidate's described "
+    "use-case DOMAIN matches the task's TOPIC — not how capable, advanced, or fast "
+    "it is. Judge ONLY the subject domain and IGNORE any wording about how hard, "
+    "advanced, or complex a model is (a hard task does NOT make an 'advanced'-"
+    "sounding model relevant). If a description says the model is unsuitable for / "
+    "only for a certain domain, score it ~0.0 on tasks OUTSIDE that domain, however "
+    "impressive the wording. 1.0 = the description squarely covers this topic; 0.0 = "
+    "clearly a different domain (e.g. a coding model on a math-proof or translation "
+    "task); use graded values for partial fit. Spread the values — do NOT make "
+    "everything 0 or 1.\n"
+    "Output ONLY this compact JSON: "
+    "{\"difficulty\":<float>,\"scores\":[{\"model\":\"<id>\",\"relevance\":<float>}, ...]}"
 )
 
 
@@ -58,8 +69,9 @@ class Classifier:
     ) -> ClassifierResult:
         """Return suitability scores for ``candidates``.
 
-        On any downstream/parse failure, falls back to tier-based heuristic scores
-        so routing never hard-fails on the classifier.
+        On any downstream/parse failure, falls back to a uniform-suitability
+        heuristic so routing never hard-fails on the classifier; the router's
+        deterministic cost/tier re-ranking then picks the cheapest, lightest model.
         """
         if not candidates:
             return ClassifierResult(scores=[])
@@ -68,8 +80,17 @@ class Classifier:
             payload = self._build_payload(req, candidates)
             data = await self._client.chat(payload)
             text = _message_text(data)
+            # Diagnostic: the alias->real mapping actually sent, and the classifier's
+            # verbatim reply. Confirms whether anonymisation is live (the reply should
+            # reference candidate-N, never real model names) and exposes degenerate
+            # winner-take-all output from a weak classifier model.
+            alias_map = {a: c.model for a, c in zip(_aliases(candidates), candidates)}
+            log.debug(
+                "classify(raw): classifier_model=%s alias_map=%s response=%r",
+                self._s.classifier_model, alias_map, text,
+            )
             result = self._parse(text, candidates)
-            log.info(
+            log.debug(
                 "classify: classifier_model=%s candidates=%s scores=%s",
                 self._s.classifier_model, names, _fmt_scores(result),
             )
@@ -86,9 +107,13 @@ class Classifier:
     def _build_payload(
         self, req: ChatCompletionRequest, candidates: list[ModelSpec]
     ) -> dict[str, Any]:
+        # Anonymise model names: the classifier is itself an LLM and would
+        # otherwise let brand priors (e.g. a famous model name) override the
+        # neutral description/tier. Opaque aliases force a description-only verdict.
+        aliases = _aliases(candidates)
         catalog = [
-            {"model": c.model, "tier": c.tier, "description": c.description}
-            for c in candidates
+            {"model": aliases[i], "description": c.description}
+            for i, c in enumerate(candidates)
         ]
         digest = _digest_conversation(req.messages)
         user_msg = (
@@ -110,37 +135,52 @@ class Classifier:
 
     def _parse(self, text: str, candidates: list[ModelSpec]) -> ClassifierResult:
         obj = json.loads(_extract_json(text))
-        valid = {c.model for c in candidates}
+        # Map the opaque aliases emitted by the classifier back to real names.
+        aliases = _aliases(candidates)
+        alias_to_model = {aliases[i]: c.model for i, c in enumerate(candidates)}
         scores: list[CandidateScore] = []
         seen: set[str] = set()
         for item in obj.get("scores", []):
-            model = item.get("model")
-            if model in valid and model not in seen:
-                scores.append(
-                    CandidateScore(model=model, score=_clamp(float(item["score"])))
-                )
+            model = alias_to_model.get(item.get("model"))
+            if model is not None and model not in seen:
+                # ``relevance`` is the new key; tolerate a stray ``score`` too.
+                raw = item.get("relevance", item.get("score"))
+                scores.append(CandidateScore(model=model, score=_clamp(float(raw))))
                 seen.add(model)
-        # Ensure every candidate has a score; fill gaps heuristically.
+        # Ensure every candidate has a relevance; fill gaps with neutral suitability.
         for c in candidates:
             if c.model not in seen:
-                scores.append(CandidateScore(model=c.model, score=_tier_score(c.tier)))
+                scores.append(CandidateScore(model=c.model, score=_NEUTRAL_SUITABILITY))
         if not scores:
             raise ValueError("classifier produced no usable scores")
-        return ClassifierResult(scores=scores)
+        diff_raw = obj.get("difficulty")
+        difficulty = _clamp(float(diff_raw)) if diff_raw is not None else None
+        return ClassifierResult(scores=scores, difficulty=difficulty)
 
     def _heuristic(self, candidates: list[ModelSpec]) -> ClassifierResult:
+        # No signal available: treat every candidate as equally relevant and give no
+        # difficulty estimate, so the router skips capability-fit and lets its
+        # deterministic cost/tier re-ranking decide.
         return ClassifierResult(
             scores=[
-                CandidateScore(model=c.model, score=_tier_score(c.tier))
+                CandidateScore(model=c.model, score=_NEUTRAL_SUITABILITY)
                 for c in candidates
-            ]
+            ],
+            difficulty=None,
         )
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-_TIER_BASELINE = {"rich": 0.8, "light": 0.5, "openweight": 0.4}
+_NEUTRAL_SUITABILITY = 0.5
+
+
+def _aliases(candidates: list[ModelSpec]) -> list[str]:
+    """Opaque per-position labels shown to the classifier in place of real model
+    names, so it cannot let brand priors override the description/tier verdict.
+    Position-based, so build- and parse-time mappings agree given the same list."""
+    return [f"candidate-{i + 1}" for i in range(len(candidates))]
 
 
 def _fmt_scores(result: ClassifierResult) -> str:
@@ -159,10 +199,6 @@ def _message_text(data: dict[str, Any]) -> str:
     if content:
         return content
     return msg.get("reasoning_content") or ""
-
-
-def _tier_score(tier: str) -> float:
-    return _TIER_BASELINE.get(tier, 0.5)
 
 
 def _clamp(v: float) -> float:

@@ -6,23 +6,42 @@
 #
 # Fields per model:
 #   model           : the exact model name as exposed by LiteLLM (/v1/models)
-#   tier            : routing class — "rich" (strong) / "light" (fast) / "openweight"
-#   description     : free-text use-case ("what this model is best for"); shown to
-#                     the classifier so it can match the conversation to a model
+#   description     : free-text USE-CASE DOMAIN ONLY — what subject / kind of task
+#                     this model is for (e.g. software-development vs non-coding
+#                     general use). Shown to the classifier, which scores TOPIC
+#                     relevance from it. Do NOT mention difficulty or capability
+#                     ("hard", "advanced", "複雑", "高難度", "low-difficulty"), cost,
+#                     speed, or INPUT LENGTH: difficulty is judged separately (one
+#                     per-task estimate) and matched against `tier` in code, so
+#                     putting difficulty words here makes a weak classifier match
+#                     "hard task" to "advanced-sounding model" and ignore the actual
+#                     domain. Models that SHARE a domain (e.g. a think/no-think pair,
+#                     or several coding models) should share the SAME description and
+#                     let `tier`/`cost` distinguish them.
+#   cost            : relative monetary cost (e.g. USD per 1M tokens). Local = 0.
+#                     The router prefers cheaper models unless a pricier one is
+#                     clearly more suitable.
+#   tier            : capability level as an integer; larger = more capable / slower
+#                     / heavier. NOT shown to the classifier. Used in code: matched
+#                     against the task's difficulty for capability-fit (under-powered
+#                     models are penalised) and as a light penalty so the LOWEST tier
+#                     still suitable wins (a same-cost local think/no-think pair stays
+#                     ordered).
 #   context_window  : max input tokens (used by the hard-constraint filter)
 #   multimodal      : true if it accepts images
 #   supports_tools  : true if it supports function/tool calling
 #   is_local        : true if served locally / privacy-safe
 #   fallback_chain  : ordered failover targets when this model is unavailable
 #
-# NOTE: capability values below are starting points — tune them to your backends.
-# The classifier model (COBAITER_CLASSIFIER_MODEL) is NOT a routable target and is
-# intentionally omitted here.
+# NOTE: cost/tier/capability values below are starting points — tune them to your
+# backends. The classifier model (COBAITER_CLASSIFIER_MODEL) is NOT a routable
+# target and is intentionally omitted here.
 
 models:
   - model: bbrfkr-llm-general
-    tier: rich
-    description: "汎用の対話・推論・文章作成・要約・翻訳など、コーディング以外の幅広い用途に最適。複雑な推論やニュアンスのある執筆もこなす。"
+    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    cost: 0
+    tier: 3
     context_window: 262144
     multimodal: true
     supports_tools: true
@@ -30,28 +49,51 @@ models:
     fallback_chain: [bbrfkr-llm-general-no-think]
 
   - model: bbrfkr-llm-general-no-think
-    tier: light
-    description: "汎用用途の軽量・高速版。短い質問・事実確認・単純な対話など、深い推論を要しない用途向け。"
+    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    cost: 0
+    tier: 1
     context_window: 262144
     multimodal: false
     supports_tools: true
     is_local: true
     fallback_chain: []
 
+  - model: claude-opus-4-8
+    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    cost: 5
+    tier: 6
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: false
+    fallback_chain: [bbrfkr-llm-coding]
+
+  - model: claude-sonnet-4-6
+    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    cost: 3
+    tier: 4
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: false
+    fallback_chain: [bbrfkr-llm-coding]
+
   - model: bbrfkr-llm-coding
-    tier: rich
-    description: "コード生成・リファクタリング・デバッグ・技術設計に最適化。長いコードや複数ファイル横断の開発作業向け。"
+    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    cost: 0
+    tier: 3
     context_window: 262144
     multimodal: true
     supports_tools: true
     is_local: true
-    fallback_chain: [bbrfkr-llm-coding-no-think, bbrfkr-llm-general]
+    fallback_chain: [bbrfkr-llm-coding-no-think]
 
   - model: bbrfkr-llm-coding-no-think
-    tier: light
-    description: "コーディング用途の軽量・高速版。短いスニペット生成や単純な修正など、深い推論を要しないコード作業向け。"
+    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    cost: 0
+    tier: 1
     context_window: 262144
     multimodal: false
     supports_tools: true
     is_local: true
-    fallback_chain: [bbrfkr-llm-general-no-think]
+    fallback_chain: []

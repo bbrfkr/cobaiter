@@ -26,32 +26,33 @@ async def test_no_switch_within_dwell(engine, classifier):
 
 
 async def test_soft_switch_after_dwell_with_trigger(engine, classifier):
-    classifier.table = {"claude-haiku-4-5": 0.9, "claude-opus-4-8": 0.5}
+    classifier.table = {"claude-haiku-4-5": 0.9}
     first = await engine.decide(convo_req(1, last="hi"), header_id="c1")
     assert first.model == "claude-haiku-4-5"
     # Burn dwell turns with identical content (no trigger fires).
     await engine.decide(convo_req(2, last="hi"), header_id="c1")
     await engine.decide(convo_req(3, last="hi"), header_id="c1")
-    # Now opus is clearly better AND a cheap trigger fires (new code block).
-    classifier.table = {"claude-haiku-4-5": 0.5, "claude-opus-4-8": 0.95}
+    # Now the cheaper/local model is clearly more suitable AND a cheap trigger
+    # fires (new code block) -> its cost-adjusted score clears the margin.
+    classifier.table = {"claude-haiku-4-5": 0.5, "qwen2.5": 0.95}
     d = await engine.decide(
         convo_req(4, last="refactor ```py\nx=1\n```"), header_id="c1"
     )
     assert d.route is Route.CONTEXT_SWITCH
-    assert d.model == "claude-opus-4-8"
+    assert d.model == "qwen2.5"
 
 
 async def test_margin_blocks_marginal_switch(engine, classifier):
-    classifier.table = {"claude-haiku-4-5": 0.9, "claude-opus-4-8": 0.5}
+    classifier.table = {"claude-haiku-4-5": 0.9}
     await engine.decide(convo_req(1, last="hi"), header_id="c1")
     await engine.decide(convo_req(2, last="hi"), header_id="c1")
     await engine.decide(convo_req(3, last="hi"), header_id="c1")
-    # opus only slightly better than pinned (ema ~0.9) -> below switch_margin.
-    classifier.table = {"claude-haiku-4-5": 0.7, "claude-opus-4-8": 0.75}
+    # qwen only slightly more suitable than the pinned haiku -> below switch_margin.
+    classifier.table = {"claude-haiku-4-5": 0.7, "qwen2.5": 0.75}
     d = await engine.decide(
         convo_req(4, last="now a ```py\ny=2\n``` block"), header_id="c1"
     )
-    assert d.route is Route.PINNED
+    assert d.route is Route.CLASSIFIER_SELECT
     assert d.model == "claude-haiku-4-5"
 
 

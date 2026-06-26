@@ -7,12 +7,10 @@ Keys
 ----
 ``cobaiter:conv:<key>``   string(JSON ConversationState), per-conversation, TTL'd
 ``cobaiter:models``       hash model -> JSON ModelSpec
-``cobaiter:tier_models``  hash tier  -> JSON list[str]  (auxiliary tier index)
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 
 import redis.asyncio as redis
@@ -22,7 +20,6 @@ from .schemas import ConversationState, ModelSpec
 
 CONV_PREFIX = "cobaiter:conv:"
 MODELS_KEY = "cobaiter:models"
-TIER_KEY = "cobaiter:tier_models"
 
 
 class Store:
@@ -67,7 +64,6 @@ class Store:
     # ------------------------------------------------------------------ #
     async def put_model(self, spec: ModelSpec) -> None:
         await self._r.hset(MODELS_KEY, spec.model, spec.model_dump_json())
-        await self._reindex_tier(spec.tier)
 
     async def get_model(self, model: str) -> ModelSpec | None:
         raw = await self._r.hget(MODELS_KEY, model)
@@ -80,22 +76,7 @@ class Store:
         return [ModelSpec.model_validate_json(v) for v in raw.values()]
 
     async def delete_model(self, model: str) -> bool:
-        spec = await self.get_model(model)
-        removed = bool(await self._r.hdel(MODELS_KEY, model))
-        if spec is not None:
-            await self._reindex_tier(spec.tier)
-        return removed
-
-    async def models_for_tier(self, tier: str) -> list[str]:
-        raw = await self._r.hget(TIER_KEY, tier)
-        return json.loads(raw) if raw else []
-
-    async def _reindex_tier(self, tier: str) -> None:
-        models = [m.model for m in await self.list_models() if m.tier == tier]
-        if models:
-            await self._r.hset(TIER_KEY, tier, json.dumps(models))
-        else:
-            await self._r.hdel(TIER_KEY, tier)
+        return bool(await self._r.hdel(MODELS_KEY, model))
 
     # ------------------------------------------------------------------ #
     # Seeding
@@ -120,7 +101,6 @@ class Store:
         of truth. Returns the number of models written.
         """
         await self._r.delete(MODELS_KEY)
-        await self._r.delete(TIER_KEY)
         written = 0
         for spec in specs:
             await self.put_model(spec)
@@ -137,7 +117,8 @@ def default_seed_specs() -> list[ModelSpec]:
             multimodal=True,
             supports_tools=True,
             is_local=False,
-            tier="rich",
+            cost=5.0,
+            tier=3,
             fallback_chain=["claude-sonnet-4-6", "claude-haiku-4-5"],
         ),
         ModelSpec(
@@ -146,7 +127,8 @@ def default_seed_specs() -> list[ModelSpec]:
             multimodal=True,
             supports_tools=True,
             is_local=False,
-            tier="rich",
+            cost=3.0,
+            tier=3,
             fallback_chain=["claude-haiku-4-5"],
         ),
         ModelSpec(
@@ -155,7 +137,8 @@ def default_seed_specs() -> list[ModelSpec]:
             multimodal=True,
             supports_tools=True,
             is_local=False,
-            tier="light",
+            cost=1.0,
+            tier=1,
             fallback_chain=[],
         ),
         ModelSpec(
@@ -164,7 +147,8 @@ def default_seed_specs() -> list[ModelSpec]:
             multimodal=False,
             supports_tools=True,
             is_local=True,
-            tier="openweight",
+            cost=0.0,
+            tier=1,
             fallback_chain=[],
         ),
     ]

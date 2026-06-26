@@ -5,8 +5,8 @@ attributes. These split into two kinds:
 
 * Capabilities that *could* be discovered from LiteLLM (``multimodal``,
   ``context_window``, ``supports_tools``) but are often unset there, and
-* cobaiter-only routing **policy** (``tier``, ``fallback_chain``) that has no
-  source in LiteLLM at all.
+* cobaiter-only routing **policy** (``cost``, ``tier``, ``fallback_chain``) that
+  has no source in LiteLLM at all.
 
 Rather than hardcode this, it is hand-managed in a YAML/JSON file and injected.
 The file is the source of truth: the registry is reconciled to match it exactly
@@ -16,7 +16,9 @@ Expected shape (YAML)::
 
     models:
       - model: bbrfkr-llm-general
-        tier: rich
+        description: general-purpose chat and reasoning
+        cost: 0
+        tier: 2
         context_window: 32768
         multimodal: false
         supports_tools: true

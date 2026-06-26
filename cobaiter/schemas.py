@@ -24,10 +24,22 @@ class ModelSpec(BaseModel):
     multimodal: bool = False
     supports_tools: bool = False
     is_local: bool = False
-    # Coarse capability/cost tier, e.g. "rich" / "light" / "openweight".
-    tier: str = "light"
-    # Free-text description of what this model is best suited for. Surfaced to the
-    # classifier so it can match the conversation's actual use-case to a model.
+    # Relative monetary cost (e.g. USD per 1M tokens). Local/free models = 0.0.
+    # Drives the router's deterministic cost-aware re-ranking; NOT shown to the
+    # classifier (which scores use-case suitability only).
+    cost: float = 0.0
+    # Capability tier as an integer: larger = more capable / slower / heavier.
+    # Used by the router deterministically: it matches a candidate's tier against
+    # the task difficulty (capability fit) and adds a mild capability bonus. NOT
+    # shown to the classifier, which judges use-case *relevance* only — the tier vs
+    # difficulty maths stays in code so the score is calibrated and reproducible.
+    tier: int = 1
+    # Free-text description of the model's USE-CASE DOMAIN only (e.g. software
+    # development vs non-coding general use). Surfaced to the classifier, which
+    # scores TOPIC relevance from it — so it must NOT contain difficulty/capability,
+    # cost, speed, or input-length wording; difficulty is a separate per-task axis
+    # matched against ``tier`` in the router. Models sharing a domain should share
+    # the same description and be distinguished by ``tier``/``cost``.
     description: str = ""
     # Ordered list of alternates to try when this model becomes unavailable.
     fallback_chain: list[str] = Field(default_factory=list)
@@ -40,7 +52,6 @@ class ConversationState(BaseModel):
     """Sticky binding of a conversation to a concrete model."""
 
     model: str
-    tier: str = "light"
     # How far down the fallback chain (of the *originally chosen* model) we are.
     fallback_step: int = 0
     # 1-based *user-turn* counter (advances once per genuine new user message, NOT
@@ -74,8 +85,6 @@ class Constraints(BaseModel):
     needs_local: bool = False
     # Estimated prompt tokens; a model's context_window must exceed this.
     estimated_tokens: int = 0
-    # Explicit tier hint supplied by the caller (optional, non-binding).
-    tier_hint: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -125,11 +134,18 @@ class ChatCompletionRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 class CandidateScore(BaseModel):
     model: str
+    # Use-case suitability in 0..1. As emitted by the classifier this is pure
+    # *relevance* (does the description cover the topic); the router then folds in
+    # capability-fit (tier vs difficulty) and cost to derive the effective score.
     score: float
 
 
 class ClassifierResult(BaseModel):
     scores: list[CandidateScore] = Field(default_factory=list)
+    # Task difficulty estimate in 0..1 for the whole conversation (capability-fit
+    # input). ``None`` when the classifier gave no usable estimate (parse failure /
+    # heuristic fallback), in which case the router skips the capability-fit step.
+    difficulty: float | None = None
 
     def best(self) -> CandidateScore | None:
         return max(self.scores, key=lambda s: s.score) if self.scores else None

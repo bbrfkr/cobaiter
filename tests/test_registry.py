@@ -12,7 +12,8 @@ from cobaiter.store import Store, default_seed_specs
 _YAML = """
 models:
   - model: bbrfkr-llm-general
-    tier: rich
+    cost: 0
+    tier: 2
     description: "general-purpose chat and reasoning"
     context_window: 32768
     multimodal: true
@@ -20,7 +21,8 @@ models:
     is_local: true
     fallback_chain: [bbrfkr-llm-general-no-think]
   - model: bbrfkr-llm-general-no-think
-    tier: light
+    cost: 0
+    tier: 1
     context_window: 32768
     multimodal: false
     supports_tools: true
@@ -34,7 +36,8 @@ def test_load_registry_from_yaml(tmp_path):
     specs = load_model_registry(f)
     by = {s.model: s for s in specs}
     assert set(by) == {"bbrfkr-llm-general", "bbrfkr-llm-general-no-think"}
-    assert by["bbrfkr-llm-general"].tier == "rich"
+    assert by["bbrfkr-llm-general"].tier == 2
+    assert by["bbrfkr-llm-general"].cost == 0
     assert by["bbrfkr-llm-general"].description == "general-purpose chat and reasoning"
     assert by["bbrfkr-llm-general"].fallback_chain == ["bbrfkr-llm-general-no-think"]
     assert by["bbrfkr-llm-general-no-think"].multimodal is False
@@ -68,4 +71,3 @@ async def test_replace_models_clears_stale_entries(tmp_path):
     assert written == 2
     models = {s.model for s in await store.list_models()}
     assert models == {"bbrfkr-llm-general", "bbrfkr-llm-general-no-think"}
-    assert await store.models_for_tier("rich") == ["bbrfkr-llm-general"]

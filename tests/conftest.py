@@ -63,9 +63,11 @@ class FakeClassifier:
 
     async def score(self, req, candidates):
         self.calls += 1
+        # Unlisted models default to 0.0 (unsuitable) so a test only needs to set
+        # scores for the models it cares about; others won't win the re-ranking.
         return ClassifierResult(
             scores=[
-                CandidateScore(model=c.model, score=self.table.get(c.model, 0.5))
+                CandidateScore(model=c.model, score=self.table.get(c.model, 0.0))
                 for c in candidates
             ]
         )

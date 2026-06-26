@@ -67,18 +67,21 @@ async def test_classifier_degrades_on_transport_error():
     await http.aclose()
 
 
-async def test_classifier_payload_includes_model_description():
-    """Each candidate's use-case description must reach the classifier prompt."""
+async def test_classifier_payload_includes_description_but_not_tier():
+    """Each candidate's use-case description must reach the classifier prompt, but
+    ``tier`` must NOT: the classifier judges use-case relevance only, and the router
+    folds tier (capability-fit) in deterministically downstream."""
     import json as _json
 
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = _json.loads(request.content)
+        seen["system"] = body["messages"][0]["content"]
         seen["user"] = body["messages"][-1]["content"]
         payload = {
             "choices": [
-                {"message": {"content": _json.dumps({"scores": []})}}
+                {"message": {"content": _json.dumps({"difficulty": 0.5, "scores": []})}}
             ]
         }
         return httpx.Response(200, json=payload)
@@ -91,8 +94,8 @@ async def test_classifier_payload_includes_model_description():
     from cobaiter.schemas import ChatCompletionRequest, ModelSpec
 
     candidates = [
-        ModelSpec(model="m-coding", tier="rich", description="code generation and debugging"),
-        ModelSpec(model="m-general", tier="light", description="general chat"),
+        ModelSpec(model="m-coding", tier=3, description="code generation and debugging"),
+        ModelSpec(model="m-general", tier=1, description="general chat"),
     ]
     req = ChatCompletionRequest(
         model="cobaiter-auto", messages=[{"role": "user", "content": "hi"}]
@@ -100,6 +103,15 @@ async def test_classifier_payload_includes_model_description():
     await classifier.score(req, candidates)
     assert "code generation and debugging" in seen["user"]
     assert "general chat" in seen["user"]
+    catalog = _json.loads(seen["user"].split("Candidate models:\n", 1)[1].split("\n\n", 1)[0])
+    # Real model names are anonymised to opaque aliases (avoids brand bias) and the
+    # catalog carries description ONLY — tier/cost stay out of the classifier.
+    assert all(set(c.keys()) == {"model", "description"} for c in catalog)
+    assert "m-coding" not in seen["user"] and "m-general" not in seen["user"]
+    assert all(c["model"].startswith("candidate-") for c in catalog)
+    # The prompt asks for a difficulty estimate (consumed by the router's
+    # capability-fit), not a final score.
+    assert "difficulty" in seen["system"]
     await http.aclose()
 
 

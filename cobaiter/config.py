@@ -54,12 +54,36 @@ class Settings(BaseSettings):
     # EMA smoothing factor applied to classifier scores (0..1; higher = more reactive).
     score_ema_alpha: float = 0.5
 
+    # --- Cost / tier aware selection ---
+    # The classifier returns a use-case *relevance* (0..1) plus one task *difficulty*.
+    # The router first folds difficulty + tier into a capability-fit (penalising only
+    # UNDER-powered models), then re-ranks deterministically with two PENALTIES:
+    #     effective = suitability - cost_bias*(cost/maxCost) - tier_bias*(tier/maxTier)
+    # Both favour the cheapest, *lightest* model that is still suitable. "High tier
+    # wins on hard tasks" is already handled by capability-fit, so tier here is a
+    # penalty, NOT a bonus: its job is to avoid over-provisioning on easy tasks (do
+    # not pick a heavyweight when a lighter model is equally suitable). ``cost_bias``
+    # should dominate ``tier_bias`` ("decide on cost, then weight").
+    cost_bias: float = 0.4
+    tier_bias: float = 0.1
+    # Capability-fit normalises a candidate's tier against the MAX tier — but only
+    # among candidates that are actually in contention, i.e. whose relevance is at
+    # least this fraction of the top relevance. Out-of-domain models (relevance ~0)
+    # are excluded so an unrelated heavyweight (e.g. a tier-6 coding model on a non-
+    # coding task) cannot inflate maxTier and deflate every in-domain model's fit
+    # (which would push the no-think -> think boundary far too low).
+    capability_rel_fraction: float = 0.5
+
     # --- Credit / availability ---
     # A model whose remaining credit headroom (USD, from LiteLLM budget/spend) drops
     # below this floor is treated as unavailable and filtered out.
     credit_floor: float = 0.0
     # Cache TTL (seconds) for LiteLLM budget/spend lookups.
     credit_cache_ttl: int = 30
+
+    # --- Logging ---
+    # Logger level for the "cobaiter" logger (DEBUG/INFO/WARNING/ERROR).
+    log_level: str = "DEBUG"
 
     # --- HTTP server ---
     host: str = "0.0.0.0"

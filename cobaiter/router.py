@@ -12,6 +12,8 @@ app layer performs the downstream call and may report a failover back in (see
 
 from __future__ import annotations
 
+import logging
+
 from .classifier import Classifier
 from .config import Settings
 from .features import (
@@ -22,7 +24,9 @@ from .features import (
 )
 from .litellm_client import LiteLLMClient
 from .schemas import (
+    CandidateScore,
     ChatCompletionRequest,
+    ClassifierResult,
     Constraints,
     ConversationState,
     ModelSpec,
@@ -30,6 +34,8 @@ from .schemas import (
     RouteDecision,
 )
 from .store import Store
+
+log = logging.getLogger("cobaiter")
 
 # Output headroom required on top of the prompt estimate.
 _OUTPUT_MARGIN = 1024
@@ -80,6 +86,12 @@ class RouteEngine:
             decision = await self._continue_locked(key, constraints, eligible, state)
 
         await self._store.set_conversation(key, decision.state)
+        score = decision.state.score_ema
+        log.info(
+            "decision: conv=%s model=%s route=%s score=%s",
+            key, decision.model, decision.route.value,
+            f"{score:.3f}" if score is not None else "n/a",
+        )
         return decision
 
     async def failover_to(
@@ -99,6 +111,10 @@ class RouteEngine:
         eligible = await self._eligible_models(constraints, exclude={state.model})
         decision = await self._do_failover(key, state, eligible, failed=state.model)
         await self._store.set_conversation(key, decision.state)
+        log.info(
+            "decision: conv=%s model=%s route=%s score=n/a",
+            key, decision.model, decision.route.value,
+        )
         return decision
 
     # ------------------------------------------------------------------ #
@@ -111,10 +127,10 @@ class RouteEngine:
         constraints: Constraints,
         eligible: dict[str, ModelSpec],
     ) -> RouteDecision:
-        candidates = self._apply_tier_hint(list(eligible.values()), constraints)
+        candidates = list(eligible.values())
 
         if not candidates:
-            state = self._fresh_state(self._s.default_model, "light", req, constraints)
+            state = self._fresh_state(self._s.default_model, req, constraints)
             return RouteDecision(
                 model=self._s.default_model, route=Route.DEFAULT,
                 conversation_key=key, state=state,
@@ -122,16 +138,20 @@ class RouteEngine:
 
         if len(candidates) == 1:
             spec = candidates[0]
-            state = self._fresh_state(spec.model, spec.tier, req, constraints)
+            state = self._fresh_state(spec.model, req, constraints)
             return RouteDecision(
                 model=spec.model, route=Route.RULE,
                 conversation_key=key, state=state,
             )
 
-        result = await self._classifier.score(req, candidates)
-        best = result.best()
+        result = await self._rank(req, candidates)
+        best = self._select_best(result, candidates)
         chosen = next((c for c in candidates if c.model == best.model), candidates[0])
-        state = self._fresh_state(chosen.model, chosen.tier, req, constraints)
+        log.debug(
+            "rank(initial): conv=%s effective=%s selected=%s",
+            key, _fmt_scores(result), chosen.model,
+        )
+        state = self._fresh_state(chosen.model, req, constraints)
         state.score_ema = best.score
         state.last_recheck_turn = state.turn
         return RouteDecision(
@@ -162,9 +182,7 @@ class RouteEngine:
 
         # (b) pinned still valid: decide whether a soft re-evaluation is warranted.
         if self._should_recheck(state, req, constraints):
-            decision = await self._soft_reeval(key, req, constraints, eligible, state)
-            if decision is not None:
-                return decision
+            return await self._soft_reeval(key, req, constraints, eligible, state)
 
         # (c) stay pinned.
         self._refresh_signals(state, req, constraints)
@@ -214,23 +232,34 @@ class RouteEngine:
         constraints: Constraints,
         eligible: dict[str, ModelSpec],
         state: ConversationState,
-    ) -> RouteDecision | None:
-        candidates = self._apply_tier_hint(list(eligible.values()), constraints)
-        result = await self._classifier.score(req, candidates)
+    ) -> RouteDecision:
+        candidates = list(eligible.values())
+        result = await self._rank(req, candidates)
         state.last_recheck_turn = state.turn
+        log.info("classify: conv=%s candidates=%s", key, [c.model for c in candidates])
 
-        best = result.best()
+        best = self._select_best(result, candidates)
         pinned_raw = result.score_for(state.model)
         if best is None or pinned_raw is None:
             self._refresh_signals(state, req, constraints)
-            return None
+            return RouteDecision(
+                model=state.model, route=Route.CLASSIFIER_SELECT,
+                conversation_key=key, state=state,
+            )
 
         # EMA-smooth the pinned model's score to suppress flapping.
         pinned_ema = _ema(state.score_ema, pinned_raw, self._s.score_ema_alpha)
         state.score_ema = pinned_ema
 
         margin = best.score - pinned_ema
-        if best.model != state.model and margin > self._s.switch_margin:
+        switching = best.model != state.model and margin > self._s.switch_margin
+        log.debug(
+            "rank(recheck): conv=%s effective=%s best=%s pinned=%s(ema=%.3f) "
+            "margin=%.3f -> selected=%s",
+            key, _fmt_scores(result), best.model, state.model, pinned_ema, margin,
+            best.model if switching else state.model,
+        )
+        if switching:
             spec = eligible[best.model]
             self._switch_state(state, spec, best.score, req, constraints)
             return RouteDecision(
@@ -239,7 +268,10 @@ class RouteEngine:
             )
 
         self._refresh_signals(state, req, constraints)
-        return None
+        return RouteDecision(
+            model=state.model, route=Route.CLASSIFIER_SELECT,
+            conversation_key=key, state=state,
+        )
 
     # ------------------------------------------------------------------ #
     # Failover mechanics
@@ -260,10 +292,7 @@ class RouteEngine:
         if target is None:
             # Last resort: default_model even if marginal; app maps None-eligibility to 503.
             target = self._s.default_model
-        spec = eligible.get(target)
-        tier = spec.tier if spec else "light"
         state.model = target
-        state.tier = tier
         state.last_switch_turn = state.turn
         state.fallback_step += 1
         state.score_ema = None
@@ -347,12 +376,11 @@ class RouteEngine:
     def _fresh_state(
         self,
         model: str,
-        tier: str,
         req: ChatCompletionRequest,
         constraints: Constraints,
     ) -> ConversationState:
         state = ConversationState(
-            model=model, tier=tier, turn=1, last_switch_turn=1, chain_origin=model,
+            model=model, turn=1, last_switch_turn=1, chain_origin=model,
         )
         self._refresh_signals(state, req, constraints)
         return state
@@ -366,7 +394,6 @@ class RouteEngine:
         constraints: Constraints,
     ) -> None:
         state.model = spec.model
-        state.tier = spec.tier
         state.last_switch_turn = state.turn
         state.chain_origin = spec.model
         state.fallback_step = 0
@@ -383,19 +410,136 @@ class RouteEngine:
         state.sig_constraints = _constraint_sig(constraints)
         state.sig_token_band = _token_band(constraints.estimated_tokens)
 
-    def _apply_tier_hint(
-        self, candidates: list[ModelSpec], constraints: Constraints
-    ) -> list[ModelSpec]:
-        if constraints.tier_hint:
-            matching = [c for c in candidates if c.tier == constraints.tier_hint]
-            if matching:
-                return matching
-        return candidates
+    # ------------------------------------------------------------------ #
+    # Scoring pipeline: classifier -> capability-fit -> cost/tier re-ranking
+    # ------------------------------------------------------------------ #
+    async def _rank(
+        self, req: ChatCompletionRequest, candidates: list[ModelSpec]
+    ) -> ClassifierResult:
+        """Run the classifier and fold its semantic judgement into effective scores.
+
+        Three stages: the classifier emits per-candidate *relevance* + one task
+        *difficulty*; ``_apply_difficulty`` turns those into use-case suitability via
+        tier-vs-difficulty capability-fit; ``_adjust_scores`` then applies the
+        deterministic cost penalty / tier bonus.
+        """
+        raw = await self._classifier.score(req, candidates)
+        return self._adjust_scores(self._apply_difficulty(raw, candidates), candidates)
+
+    def _apply_difficulty(
+        self, result: ClassifierResult, candidates: list[ModelSpec]
+    ) -> ClassifierResult:
+        """Fold task difficulty + capability tier into per-candidate relevance.
+
+        ``suitability = relevance * capability_fit`` where
+        ``capability_fit = 1 - max(0, difficulty - tier/maxTier)``.
+
+        A model is penalised only when *under-powered* for the task (its normalised
+        tier falls short of the difficulty); ample capability is never punished.
+
+        ``maxTier`` is taken over the candidates actually IN CONTENTION — those whose
+        relevance is at least ``capability_rel_fraction`` of the top relevance — not
+        the whole set. Otherwise an out-of-domain heavyweight (e.g. a tier-6 coding
+        model on a non-coding task, relevance ~0) would inflate maxTier and deflate
+        every in-domain model's fit, pushing the no-think -> think boundary far too
+        low (a trivial title-generation task would then upgrade to a think model).
+
+        When the classifier gave no difficulty estimate (parse failure / heuristic
+        fallback) relevance passes through unchanged.
+        """
+        if result.difficulty is None:
+            return result
+        specs = {c.model: c for c in candidates}
+        # Size capability against the in-domain contenders only.
+        max_rel = max((s.score for s in result.scores), default=0.0)
+        threshold = max_rel * self._s.capability_rel_fraction
+        contenders = [
+            specs[s.model].tier
+            for s in result.scores
+            if s.model in specs and s.score >= threshold
+        ]
+        max_tier = max(contenders, default=0) or 1
+        difficulty = result.difficulty
+        adjusted: list[CandidateScore] = []
+        for s in result.scores:
+            spec = specs.get(s.model)
+            if spec is None:
+                adjusted.append(s)
+                continue
+            capability_fit = 1.0 - max(0.0, difficulty - spec.tier / max_tier)
+            adjusted.append(
+                CandidateScore(model=s.model, score=s.score * capability_fit)
+            )
+        return ClassifierResult(scores=adjusted)
+
+    # ------------------------------------------------------------------ #
+    # Cost / tier aware re-ranking of pure suitability scores
+    # ------------------------------------------------------------------ #
+    def _adjust_scores(
+        self, result: ClassifierResult, candidates: list[ModelSpec]
+    ) -> ClassifierResult:
+        """Fold cost + tier into the classifier's pure suitability scores.
+
+        ``effective = suitability - cost_bias*(cost/maxCost) - tier_bias*(tier/maxTier)``
+
+        Both terms are PENALTIES: cheaper wins, and — all else equal — the *lightest*
+        model wins. "Is the model capable enough for a hard task?" is already handled
+        upstream by ``_apply_difficulty`` (capability-fit), which penalises only
+        under-powered models; this tier penalty does the complementary job of NOT
+        over-provisioning on easy tasks (don't pick a heavyweight when a lighter
+        model is equally suitable). Costs/tiers are normalised across the current
+        candidate set so the biases stay in suitability units. The result drives
+        selection AND the hysteresis (EMA / margin) downstream.
+        """
+        specs = {c.model: c for c in candidates}
+        max_cost = max((c.cost for c in candidates), default=0.0) or 1.0
+        max_tier = max((c.tier for c in candidates), default=0) or 1
+        adjusted: list[CandidateScore] = []
+        for s in result.scores:
+            spec = specs.get(s.model)
+            if spec is None:
+                adjusted.append(s)
+                continue
+            effective = (
+                s.score
+                - self._s.cost_bias * (spec.cost / max_cost)
+                - self._s.tier_bias * (spec.tier / max_tier)
+            )
+            adjusted.append(CandidateScore(model=s.model, score=effective))
+        return ClassifierResult(scores=adjusted)
+
+    def _select_best(
+        self, result: ClassifierResult, candidates: list[ModelSpec]
+    ) -> CandidateScore | None:
+        """Pick the highest effective score, breaking exact ties deterministically
+        in favour of local, then cheaper, then lower-tier (lighter) models —
+        consistent with the cost/tier penalties: prefer the lightest model that is
+        equally suitable."""
+        specs = {c.model: c for c in candidates}
+
+        def key(s: CandidateScore) -> tuple:
+            spec = specs.get(s.model)
+            return (
+                s.score,
+                1 if (spec and spec.is_local) else 0,
+                -(spec.cost if spec else 0.0),
+                -(spec.tier if spec else 0),
+            )
+
+        return max(result.scores, key=key) if result.scores else None
 
 
 # --------------------------------------------------------------------------- #
 # Pure helpers
 # --------------------------------------------------------------------------- #
+def _fmt_scores(result: ClassifierResult) -> str:
+    """Format effective (cost/tier-adjusted) scores, highest first, for logging."""
+    return ", ".join(
+        f"{s.model}={s.score:.3f}"
+        for s in sorted(result.scores, key=lambda s: s.score, reverse=True)
+    )
+
+
 def _satisfies(spec: ModelSpec, c: Constraints) -> bool:
     if c.needs_multimodal and not spec.multimodal:
         return False

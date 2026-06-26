@@ -26,7 +26,7 @@ AIエージェント ──(cobaiter-auto, OpenAI互換)──▶ cobaiter ─�
                                                   │                               ▲
                 ┌─────────────────────────────────┼──────────────┐               │ budget/spend 参照
    会話状態(Valkey)            モデルレジストリ(Valkey)        軽量分類モデル        │ (クレジット余力)
-   conv:<key>→{model,...}     capabilities/窓/tier/          (LiteLLM経由)─────────┘
+   conv:<key>→{model,...}     capabilities/窓/cost/tier/     (LiteLLM経由)─────────┘
                               fallback_chain                 ※複数候補時だけ
 ```
 
@@ -71,7 +71,7 @@ COBAITER_VALKEY_URL=redis://localhost:6379/0 uv run python -m cobaiter
 
 ### モデルレジストリ（設定ファイルで外部注入）
 
-どのモデルをどの `tier`／能力／フォールバックに分類するかは、**外部の設定ファイルで手動管理**します
+どのモデルをどの `cost`／`tier`／能力／フォールバックに分類するかは、**外部の設定ファイルで手動管理**します
 （ハードコードしません）。パスは `COBAITER_MODELS_CONFIG`（既定では未指定＝内蔵デフォルト）で指定し、
 compose では `models.yaml` をコンテナにマウントします。**このファイルが真実の源**で、起動時にレジストリは
 ファイルの内容ちょうどに同期されます（ファイルに無いモデルは削除）。
@@ -80,8 +80,9 @@ compose では `models.yaml` をコンテナにマウントします。**この�
 # models.yaml
 models:
   - model: bbrfkr-llm-general          # LiteLLM が公開する実モデル名
-    tier: rich                         # rich / light / openweight
-    description: 汎用の対話・推論・文章作成向け  # このモデルの用途（分類器に渡る）
+    description: 汎用の対話・推論・文章作成向け  # このモデルの「用途」のみ（分類器に渡る）
+    cost: 0                            # 相対コスト（USD/Mtok 目安、ローカル=0）
+    tier: 2                            # 能力レベル（整数・大きいほど高性能/低速）
     context_window: 262144
     multimodal: true
     supports_tools: true
@@ -90,8 +91,33 @@ models:
   # ... 以降、運用するモデルを列挙
 ```
 
-`description` は各モデルの**用途を表す自由文**で、分類器のカタログにそのまま渡されます。会話の実際の用途と
-`description` を照合してモデルを選ぶため、`tier`（能力ラベル）とは別に「何向けのモデルか」を伝えられます。
+**関心の分離**がこのスキーマの肝です。`description` は各モデルの**用途のみ**を表す自由文で、分類器はこれだけを見て
+2つだけを判定します（コスト・速度・能力の文言は一切見せない）:
+
+- **`relevance`（0..1）** … 各候補の用途がタスクの**トピック**にどれだけ合うか（能力の高低ではない）
+- **`difficulty`（0..1）** … タスク全体の**難易度**（1つのスカラ）
+
+連続値の算術は LLM ではなく**ルーターのコード**が決定的に合成します。まず能力適合を作り、続いて cost/tier を再ランキング:
+
+```
+capability_fit = 1 − max(0, difficulty − tier/maxTier)   # 力不足のときだけ減点、過剰能力は満点
+suitability    = relevance × capability_fit
+effective      = suitability − cost_bias×(cost/maxCost) − tier_bias×(tier/maxTier)
+```
+
+これにより「**難しいタスクは高 tier を、簡単なタスクは無料/ローカル（cost=0）をしっかり使い**、有料モデルは明確に
+優位なときだけ選ぶ」挙動になります。校正済みフロートをコード側で作るので、スコアが 0/1 に潰れず 0..1 に分布します。
+
+`capability_fit` の `maxTier` は**実際に競合している候補**（relevance がトップの `COBAITER_CAPABILITY_REL_FRACTION`
+＝既定 0.5 以上）だけで取ります。relevance ~0 の畑違いモデル（例: 非コーディングタスクにおける高 tier の coding
+モデル）が `maxTier` を吊り上げてドメイン内モデルの fit を不当に下げ、no-think→think の境界を下げすぎる（タイトル生成の
+ような自明なタスクまで think に上がる）のを防ぐためです。
+
+**`tier` の役割分担**（重要）: 「**難しいタスクで高 tier を選ぶ**」は `capability_fit`（力不足だけ減点）が担います。
+一方 `effective` の `tier` 項は**ペナルティ**で、「**足りているなら、より軽い（低 tier）モデルを選ぶ**」＝簡単なタスクで
+重いモデルを過剰に使わない（over-provision を避ける）ための項です。つまり `cost` も `tier` も**ペナルティ**で対称的に
+「安く・軽く、ただし十分なものを」を表現します（同点時のタイブレークも local → 安い → 低 tier の順）。重み
+`cost_bias`／`tier_bias` は `COBAITER_COST_BIAS`／`COBAITER_TIER_BIAS` で調整できます（`cost_bias > tier_bias` が原則）。
 
 実行中の一時的な上書きは `PUT /admin/models` でも可能ですが、再起動すると設定ファイルに再同期されます。
 能力値（窓・マルチモーダル・ツール対応）はバックエンドに合わせて手動調整してください
@@ -201,5 +227,6 @@ uv run pytest
   `/healthz` は Valkey 障害時 `degraded` を返す。
 - 分類モデルが "thinking" 型でも動作するよう、`COBAITER_CLASSIFIER_MAX_TOKENS`（既定 2048）で思考＋JSON の
   出力長を確保し、`content` が空なら `reasoning_content` からも JSON を回収する。分類が失敗した場合は
-  tier ベースのヒューリスティックへ安全にフォールバックし、ログに分類モデル名・スコア・採否を出力する。
+  全候補を一律 suitability とみなして安全にフォールバックし（あとはルーターの cost/tier 再ランクが最安・最軽量を
+  選ぶ）、ログに分類モデル名・スコア・採否を出力する。
 - API キー等の機密は `.env` で管理し、ログ・レスポンスに出さない。

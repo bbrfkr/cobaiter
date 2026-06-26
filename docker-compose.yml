@@ -5,8 +5,6 @@ services:
     command: ["valkey-server", "--appendonly", "yes"]
     volumes:
       - valkey-data:/data
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s

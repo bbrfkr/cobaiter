@@ -25,15 +25,21 @@ from .store import Store, default_seed_specs
 log = logging.getLogger("cobaiter")
 
 
-def _configure_logging(level: int = logging.INFO) -> None:
+def _configure_logging(level: int | str = logging.INFO) -> None:
     """Ensure cobaiter's logger emits to stderr (uvicorn's default config does not
-    attach a handler for it, so INFO records would otherwise be swallowed)."""
+    attach a handler for it, so INFO records would otherwise be swallowed).
+
+    ``level`` may be a logging constant or a level name (e.g. "DEBUG"); an
+    unrecognised name falls back to INFO.
+    """
     if not log.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s [cobaiter] %(message)s")
         )
         log.addHandler(handler)
+    if isinstance(level, str):
+        level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
     log.setLevel(level)
     log.propagate = False
 
@@ -47,7 +53,7 @@ def create_app(
     seed: bool = True,
 ) -> FastAPI:
     settings = settings or get_settings()
-    _configure_logging()
+    _configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -126,7 +132,9 @@ def _register_routes(app: FastAPI) -> None:
         )
         constraints = extract_constraints(req, privacy_header=privacy_header)
 
-        log.info(
+        # The routing decision (with score) is logged once by RouteEngine.decide as
+        # the canonical "decision:" line; keep only a debug breadcrumb here.
+        log.debug(
             "route: conv=%s route=%s model=%s stream=%s",
             decision.conversation_key, decision.route.value, decision.model, req.stream,
         )

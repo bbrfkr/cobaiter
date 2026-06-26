@@ -4,29 +4,21 @@
 #
 # Docs: https://docs.litellm.ai/docs/proxy/configs
 model_list:
-  - model_name: claude-opus-4-8
-    litellm_params:
-      model: anthropic/claude-opus-4-8
-      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: chatgpt/gpt-5.5
     model_info:
-      max_budget: 50.0      # USD; cobaiter reads (max_budget - spend) as headroom
-
-  - model_name: claude-sonnet-4-6
+      mode: responses
     litellm_params:
-      model: anthropic/claude-sonnet-4-6
-      api_key: os.environ/ANTHROPIC_API_KEY
+      model: chatgpt/gpt-5.5
+  - model_name: chatgpt/gpt-5.3-codex
     model_info:
-      max_budget: 50.0
-
-  - model_name: claude-haiku-4-5
+      mode: responses
     litellm_params:
-      model: anthropic/claude-haiku-4-5
-      api_key: os.environ/ANTHROPIC_API_KEY
-
-  - model_name: qwen2.5
+      model: chatgpt/gpt-5.3-codex
+  - model_name: chatgpt/gpt-5.3-codex-spark
+    model_info:
+      mode: responses
     litellm_params:
-      model: ollama/qwen2.5
-      api_base: http://host.docker.internal:11434
+      model: chatgpt/gpt-5.3-codex-spark
 
 litellm_settings:
   drop_params: true

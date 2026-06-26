@@ -92,7 +92,7 @@ def test_admin_model_and_conversation(app_ctx):
     tc, _, _ = app_ctx
     put = tc.put(
         "/admin/models",
-        json={"model": "glm-4", "context_window": 128000, "tier": "light", "supports_tools": True},
+        json={"model": "glm-4", "context_window": 128000, "cost": 0, "tier": 1, "supports_tools": True},
     )
     assert put.json()["status"] == "ok"
 
