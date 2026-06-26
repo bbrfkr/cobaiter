@@ -480,7 +480,7 @@ class RouteEngine:
     ) -> ClassifierResult:
         """Fold cost + tier into the classifier's pure suitability scores.
 
-        ``effective = suitability - cost_bias*(cost/maxCost) - tier_bias*(tier/maxTier)``
+        ``effective = suitability - (cost_penalty + tier_penalty) * (1 - suitability)``
 
         Both terms are PENALTIES: cheaper wins, and — all else equal — the *lightest*
         model wins. "Is the model capable enough for a hard task?" is already handled
@@ -500,10 +500,14 @@ class RouteEngine:
             if spec is None:
                 adjusted.append(s)
                 continue
+            penalty_factor = max(0.0, 1.0 - s.score)
             effective = (
                 s.score
-                - self._s.cost_bias * (spec.cost / max_cost)
-                - self._s.tier_bias * (spec.tier / max_tier)
+                - (
+                    self._s.cost_bias * (spec.cost / max_cost)
+                    + self._s.tier_bias * (spec.tier / max_tier)
+                )
+                * penalty_factor
             )
             adjusted.append(CandidateScore(model=s.model, score=effective))
         return ClassifierResult(scores=adjusted)
