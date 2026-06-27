@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # small: the conversation digest is the dominant contributor to classifier INPUT
     # tokens (prefill), and a large value makes every classifier call slower for no
     # routing gain.
-    classifier_digest_chars: int = 800
+    classifier_digest_chars: int = 400
     # Safe fallback when no candidate satisfies the constraints.
     default_model: str = "claude-haiku-4-5"
 
