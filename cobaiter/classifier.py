@@ -33,27 +33,18 @@ log = logging.getLogger("cobaiter")
 # code, so scores spread across 0..1 instead of collapsing to {0, 1}. Cost and
 # tier are deliberately NOT shown — relevance must stay capability/price neutral.
 _SYSTEM = (
-    "You assess a user's task against candidate models. Each candidate has only a "
-    "`description` (what it is for) and an opaque `model` id — judge ONLY by the "
-    "description; the id is meaningless. Ignore cost, speed, and capability — those "
-    "are handled elsewhere.\n"
-    "Return TWO things as JSON:\n"
-    "1. `difficulty`: ONE number 0.0-1.0 for the whole task — how much skill and "
-    "depth of reasoning it demands. 0.0 = trivial (greeting, simple lookup), 0.5 = "
-    "moderate, 1.0 = very hard (deep/expert reasoning). Judge from what is asked, "
-    "not from message length.\n"
-    "2. `relevance` per candidate: 0.0-1.0 for how well the candidate's described "
-    "use-case DOMAIN matches the task's TOPIC — not how capable, advanced, or fast "
-    "it is. Judge ONLY the subject domain and IGNORE any wording about how hard, "
-    "advanced, or complex a model is (a hard task does NOT make an 'advanced'-"
-    "sounding model relevant). If a description says the model is unsuitable for / "
-    "only for a certain domain, score it ~0.0 on tasks OUTSIDE that domain, however "
-    "impressive the wording. 1.0 = the description squarely covers this topic; 0.0 = "
-    "clearly a different domain (e.g. a coding model on a math-proof or translation "
-    "task); use graded values for partial fit. Spread the values — do NOT make "
-    "everything 0 or 1.\n"
-    "Output ONLY this compact JSON: "
-    "{\"difficulty\":<float>,\"scores\":[{\"model\":\"<id>\",\"relevance\":<float>}, ...]}"
+    "You score candidate models for a user's task. Judge each candidate ONLY by its "
+    "described use-case DOMAIN; ignore cost, speed, capability, and any wording about "
+    "how advanced/hard/complex a model is (a hard task does NOT make an 'advanced'-"
+    "sounding model relevant).\n"
+    "Return ONLY compact JSON: {\"d\":<float>,\"r\":[<float>,...]}\n"
+    "- d = task difficulty 0.0-1.0 (0=trivial greeting/lookup, 0.5=moderate, "
+    "1.0=deep/expert reasoning), judged from what is asked, not message length.\n"
+    "- r = one relevance 0.0-1.0 PER candidate, in the SAME ORDER as the numbered "
+    "list, for how well its domain matches the task topic (1.0=squarely covers it, "
+    "0.0=clearly a different domain, e.g. a coding model on a translation task). If a "
+    "description says the model is only for / unsuitable for a domain, score ~0.0 "
+    "outside that domain. Spread the values; do NOT make everything 0 or 1."
 )
 
 
@@ -80,9 +71,9 @@ class Classifier:
             payload = self._build_payload(req, candidates)
             data = await self._client.chat(payload)
             text = _message_text(data)
-            # Diagnostic: the alias->real mapping actually sent, and the classifier's
-            # verbatim reply. Confirms whether anonymisation is live (the reply should
-            # reference candidate-N, never real model names) and exposes degenerate
+            # Diagnostic: the position->real-model mapping (the order the numbered
+            # catalog was sent in, i.e. how the classifier's ``r`` array maps back to
+            # models) plus the classifier's verbatim reply. Exposes degenerate
             # winner-take-all output from a weak classifier model.
             alias_map = {a: c.model for a, c in zip(_aliases(candidates), candidates)}
             log.debug(
@@ -107,18 +98,18 @@ class Classifier:
     def _build_payload(
         self, req: ChatCompletionRequest, candidates: list[ModelSpec]
     ) -> dict[str, Any]:
-        # Anonymise model names: the classifier is itself an LLM and would
-        # otherwise let brand priors (e.g. a famous model name) override the
-        # neutral description/tier. Opaque aliases force a description-only verdict.
-        aliases = _aliases(candidates)
-        catalog = [
-            {"model": aliases[i], "description": c.description}
-            for i, c in enumerate(candidates)
-        ]
-        digest = _digest_conversation(req.messages)
+        # Anonymise model names: the classifier is itself an LLM and would otherwise
+        # let brand priors (e.g. a famous model name) override the neutral
+        # description. Show only a numbered list of descriptions — no model ids — and
+        # take back relevance as an array aligned to that order. This both forces a
+        # description-only verdict and keeps the prompt (input tokens) small.
+        catalog = "\n".join(
+            f"{i + 1}. {c.description}" for i, c in enumerate(candidates)
+        )
+        digest = _digest_conversation(req.messages, self._s.classifier_digest_chars)
         user_msg = (
-            "Candidate models:\n"
-            + json.dumps(catalog)
+            "Candidate models (numbered):\n"
+            + catalog
             + "\n\nConversation (most recent last):\n"
             + digest
         )
@@ -135,25 +126,21 @@ class Classifier:
 
     def _parse(self, text: str, candidates: list[ModelSpec]) -> ClassifierResult:
         obj = json.loads(_extract_json(text))
-        # Map the opaque aliases emitted by the classifier back to real names.
-        aliases = _aliases(candidates)
-        alias_to_model = {aliases[i]: c.model for i, c in enumerate(candidates)}
-        scores: list[CandidateScore] = []
-        seen: set[str] = set()
-        for item in obj.get("scores", []):
-            model = alias_to_model.get(item.get("model"))
-            if model is not None and model not in seen:
-                # ``relevance`` is the new key; tolerate a stray ``score`` too.
-                raw = item.get("relevance", item.get("score"))
-                scores.append(CandidateScore(model=model, score=_clamp(float(raw))))
-                seen.add(model)
-        # Ensure every candidate has a relevance; fill gaps with neutral suitability.
-        for c in candidates:
-            if c.model not in seen:
-                scores.append(CandidateScore(model=c.model, score=_NEUTRAL_SUITABILITY))
-        if not scores:
+        # ``r`` is a per-candidate relevance array, positionally aligned to the
+        # numbered catalog sent in _build_payload.
+        rels = obj.get("r")
+        if not isinstance(rels, list) or not rels:
             raise ValueError("classifier produced no usable scores")
-        diff_raw = obj.get("difficulty")
+        scores: list[CandidateScore] = []
+        for i, c in enumerate(candidates):
+            raw = rels[i] if i < len(rels) else None
+            try:
+                # A missing/garbled entry falls back to neutral, never hard-fails.
+                score = _clamp(float(raw))
+            except (TypeError, ValueError):
+                score = _NEUTRAL_SUITABILITY
+            scores.append(CandidateScore(model=c.model, score=score))
+        diff_raw = obj.get("d")
         difficulty = _clamp(float(diff_raw)) if diff_raw is not None else None
         return ClassifierResult(scores=scores, difficulty=difficulty)
 
@@ -205,7 +192,7 @@ def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
 
 
-def _digest_conversation(messages: list[dict[str, Any]], limit: int = 4000) -> str:
+def _digest_conversation(messages: list[dict[str, Any]], limit: int = 800) -> str:
     parts: list[str] = []
     for m in messages:
         role = m.get("role", "?")

@@ -36,10 +36,18 @@ class Settings(BaseSettings):
     virtual_model: str = "cobaiter-auto"
     # Lightweight model used to score candidate models when more than one remains.
     classifier_model: str = "claude-haiku-4-5"
-    # Max completion tokens for a classifier call. Must be large enough for
-    # "thinking" classifier models to finish reasoning AND emit the JSON verdict
-    # (a too-small value truncates before the JSON, forcing the heuristic fallback).
-    classifier_max_tokens: int = 2048
+    # Max completion tokens for a classifier call. The classifier emits a tiny JSON
+    # verdict ({"d":<float>,"r":[<float>,...]}), so this only needs slack for that.
+    # Keep reasoning DISABLED on the classifier model (e.g. enable_thinking:false):
+    # a "thinking" model spends tokens (and seconds) reasoning before the JSON, which
+    # both slows the call and can truncate the verdict.
+    classifier_max_tokens: int = 512
+    # Max characters of recent conversation shown to the classifier. The classifier
+    # only needs the latest request to judge difficulty + domain, so this is kept
+    # small: the conversation digest is the dominant contributor to classifier INPUT
+    # tokens (prefill), and a large value makes every classifier call slower for no
+    # routing gain.
+    classifier_digest_chars: int = 800
     # Safe fallback when no candidate satisfies the constraints.
     default_model: str = "claude-haiku-4-5"
 
