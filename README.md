@@ -102,11 +102,19 @@ models:
 ```
 capability_fit = 1 − max(0, difficulty − tier/maxTier)   # 力不足のときだけ減点、過剰能力は満点
 suitability    = relevance × capability_fit
-effective      = suitability − cost_bias×(cost/maxCost) − tier_bias×(tier/maxTier)
+effective      = suitability − (cost_bias×(cost/maxCost) + tier_bias×(tier/maxTier)) × (1 − difficulty)
 ```
 
 これにより「**難しいタスクは高 tier を、簡単なタスクは無料/ローカル（cost=0）をしっかり使い**、有料モデルは明確に
 優位なときだけ選ぶ」挙動になります。校正済みフロートをコード側で作るので、スコアが 0/1 に潰れず 0..1 に分布します。
+
+cost/tier ペナルティは `(1 − difficulty)` でスケールします。**簡単なタスクほどコスト/tier を満額で効かせ**（過剰投資を
+避け、最安・最軽量の十分なモデルを選ぶ）、**難しいタスクほどペナルティを緩め**（能力に対価を払う価値があるので、明確に
+高能力な有料モデルが勝てる）ようにします。つまり difficulty が「コストと能力のトレードオフ」を一括で握るノブです。
+**各モデル自身の suitability ではなく difficulty でスケールする**のが要点で、`(1 − suitability)` でスケールすると分類器が
+「ドメイン的にドンピシャ（suitability=1.0）」と判定した瞬間にコストペナルティが 0 になり、同じく十分な無料ローカル
+モデルがあっても有料クラウドが必ず勝ってしまう（コスト選好が無効化される）ためです。difficulty が無い場合（分類器の
+パース失敗・ヒューリスティックフォールバック）はペナルティを満額適用し、最安・最軽量へ素直に倒します。
 
 `capability_fit` の `maxTier` は**実際に競合している候補**（relevance がトップの `COBAITER_CAPABILITY_REL_FRACTION`
 ＝既定 0.5 以上）だけで取ります。relevance ~0 の畑違いモデル（例: 非コーディングタスクにおける高 tier の coding

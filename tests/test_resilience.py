@@ -118,6 +118,26 @@ async def test_classifier_payload_includes_description_but_not_tier():
     await http.aclose()
 
 
+def test_digest_keeps_instruction_head_and_recent_tail():
+    """When the conversation exceeds the budget the digest must keep BOTH ends.
+
+    A title-generation request states its (trivial) action up-front and embeds the
+    real conversation as the body; a tail-only digest would hide that action and
+    show only the embedded (possibly hard) content, inflating the difficulty
+    estimate. Keeping the head preserves the actual instruction."""
+    from cobaiter.classifier import _digest_conversation
+
+    head_instruction = "Generate a concise 3-5 word title for the following chat"
+    tail_marker = "MOST_RECENT_LINE"
+    messages = [
+        {"role": "user", "content": head_instruction + " " + ("filler " * 500) + tail_marker}
+    ]
+    digest = _digest_conversation(messages, limit=300)
+    assert "title" in digest  # the up-front action survives
+    assert tail_marker in digest  # the recent tail survives
+    assert len(digest) <= 300 + len("\n…\n")
+
+
 # --- Valkey state-store failure ------------------------------------------ #
 class _BrokenRedis:
     """Every operation raises a redis ConnectionError."""

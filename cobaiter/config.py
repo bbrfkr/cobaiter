@@ -65,13 +65,21 @@ class Settings(BaseSettings):
     # --- Cost / tier aware selection ---
     # The classifier returns a use-case *relevance* (0..1) plus one task *difficulty*.
     # The router first folds difficulty + tier into a capability-fit (penalising only
-    # UNDER-powered models), then re-ranks deterministically with two PENALTIES:
-    #     effective = suitability - cost_bias*(cost/maxCost) - tier_bias*(tier/maxTier)
+    # UNDER-powered models), then re-ranks deterministically with two PENALTIES that
+    # are themselves relaxed on hard tasks:
+    #     effective = suitability
+    #               - (cost_bias*(cost/maxCost) + tier_bias*(tier/maxTier)) * (1 - difficulty)
     # Both favour the cheapest, *lightest* model that is still suitable. "High tier
     # wins on hard tasks" is already handled by capability-fit, so tier here is a
     # penalty, NOT a bonus: its job is to avoid over-provisioning on easy tasks (do
-    # not pick a heavyweight when a lighter model is equally suitable). ``cost_bias``
-    # should dominate ``tier_bias`` ("decide on cost, then weight").
+    # not pick a heavyweight when a lighter model is equally suitable). The
+    # ``(1 - difficulty)`` factor makes difficulty the single knob trading cost for
+    # capability: easy tasks pay full cost/tier penalty (cheap light model wins),
+    # hard tasks relax it (a clearly-more-capable premium model may win). Scaling by
+    # difficulty rather than by each model's own suitability is deliberate — the
+    # latter zeroes the penalty for any perfect-fit model, letting an expensive cloud
+    # model always beat an equally-suitable free local one. ``cost_bias`` should
+    # dominate ``tier_bias`` ("decide on cost, then weight").
     cost_bias: float = 0.4
     tier_bias: float = 0.1
     # Capability-fit normalises a candidate's tier against the MAX tier — but only

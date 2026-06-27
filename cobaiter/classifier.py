@@ -39,8 +39,12 @@ _SYSTEM = (
     "sounding model relevant).\n"
     "Return ONLY ONE LINE of minified JSON with NO spaces and NO newlines, exactly: "
     "{\"d\":<float>,\"r\":[<float>,...]}\n"
-    "- d = task difficulty 0.0-1.0 (0=trivial greeting/lookup, 0.5=moderate, "
-    "1.0=deep/expert reasoning), judged from what is asked, not message length.\n"
+    "- d = task difficulty 0.0-1.0 (0=trivial greeting/lookup/title, 0.5=moderate, "
+    "1.0=deep/expert reasoning). Judge the ACTION the user asks for, NOT the "
+    "difficulty of any quoted or embedded material: a meta-task over even expert "
+    "content — writing a short title, summarising, translating, reformatting, "
+    "extracting — is LOW difficulty (~0.1-0.2). Judge from what is asked, not "
+    "message length.\n"
     "- r = one relevance 0.0-1.0 PER candidate, in the SAME ORDER as the numbered "
     "list, for how well its domain matches the task topic (1.0=squarely covers it, "
     "0.0=clearly a different domain, e.g. a coding model on a translation task). If a "
@@ -206,7 +210,17 @@ def _digest_conversation(messages: list[dict[str, Any]], limit: int = 800) -> st
             )
         parts.append(f"{role}: {content}")
     text = "\n".join(parts)
-    return text[-limit:]
+    if len(text) <= limit:
+        return text
+    # Over budget: keep BOTH ends rather than only the tail. The HEAD carries the
+    # task instruction that often sits up-front (e.g. a "generate a title for the
+    # following chat" wrapper whose body is the embedded conversation); keeping only
+    # the tail would show the classifier the embedded content and hide the actual,
+    # trivial action — inflating the difficulty estimate. The tail keeps the most
+    # recent context. Total stays within ``limit`` bar the short elision marker.
+    head = limit // 3
+    tail = limit - head
+    return text[:head] + "\n…\n" + text[-tail:]
 
 
 def _extract_json(text: str) -> str:
