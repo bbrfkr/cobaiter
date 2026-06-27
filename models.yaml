@@ -39,7 +39,7 @@
 
 models:
   - model: gpt-5.5
-    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    description: "コーディング・ソフトウェア開発以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。ソフトウェアや技術的な話題（コード・設計・不具合・運用）は対象外。"
     cost: 5
     tier: 6
     context_window: 262144
@@ -49,7 +49,7 @@ models:
     fallback_chain: [bbrfkr-llm-general]
 
   - model: bbrfkr-llm-general
-    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    description: "コーディング・ソフトウェア開発以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。ソフトウェアや技術的な話題（コード・設計・不具合・運用）は対象外。"
     cost: 0
     tier: 3
     context_window: 262144
@@ -59,7 +59,7 @@ models:
     fallback_chain: [bbrfkr-llm-general-no-think]
 
   - model: bbrfkr-llm-general-no-think
-    description: "コーディング以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。"
+    description: "コーディング・ソフトウェア開発以外の汎用用途。対話・質問応答・数学や論理を含む推論・文章作成・要約・翻訳など。ソフトウェアや技術的な話題（コード・設計・不具合・運用）は対象外。"
     cost: 0
     tier: 1
     context_window: 262144
@@ -69,7 +69,7 @@ models:
     fallback_chain: []
 
   - model: claude-opus-4-8
-    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    description: "ソフトウェア開発・技術全般の用途。コード生成・レビュー・リファクタリング・デバッグ、技術設計、ソフトウェアに関する課題分析・原因調査・改善提案・運用相談など。コーディング以外の一般用途には不向き。"
     cost: 5
     tier: 6
     context_window: 262144
@@ -79,7 +79,7 @@ models:
     fallback_chain: [bbrfkr-llm-coding]
 
   - model: bbrfkr-llm-coding
-    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    description: "ソフトウェア開発・技術全般の用途。コード生成・レビュー・リファクタリング・デバッグ、技術設計、ソフトウェアに関する課題分析・原因調査・改善提案・運用相談など。コーディング以外の一般用途には不向き。"
     cost: 0
     tier: 3
     context_window: 262144
@@ -89,7 +89,7 @@ models:
     fallback_chain: [bbrfkr-llm-coding-no-think]
 
   - model: bbrfkr-llm-coding-no-think
-    description: "ソフトウェア開発用途。コード生成・リファクタリング・デバッグ・技術設計など。コーディング以外の用途には不向き。"
+    description: "ソフトウェア開発・技術全般の用途。コード生成・レビュー・リファクタリング・デバッグ、技術設計、ソフトウェアに関する課題分析・原因調査・改善提案・運用相談など。コーディング以外の一般用途には不向き。"
     cost: 0
     tier: 1
     context_window: 262144
