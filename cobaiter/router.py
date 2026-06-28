@@ -470,7 +470,9 @@ class RouteEngine:
             adjusted.append(
                 CandidateScore(model=s.model, score=s.score * capability_fit)
             )
-        return ClassifierResult(scores=adjusted)
+        # Preserve difficulty: the cost/tier re-ranking downstream scales its
+        # penalties by it (harder task -> tolerate cost/heavier model).
+        return ClassifierResult(scores=adjusted, difficulty=difficulty)
 
     # ------------------------------------------------------------------ #
     # Cost / tier aware re-ranking of pure suitability scores
@@ -478,38 +480,44 @@ class RouteEngine:
     def _adjust_scores(
         self, result: ClassifierResult, candidates: list[ModelSpec]
     ) -> ClassifierResult:
-        """Fold cost + tier into the classifier's pure suitability scores.
+        """Fold cost + tier into the classifier's suitability scores.
 
-        ``effective = suitability - (cost_penalty + tier_penalty) * (1 - suitability)``
+        ``effective = suitability - (cost_bias*(cost/maxCost) + tier_bias*(tier/maxTier)) * cost_relax``
 
         Both terms are PENALTIES: cheaper wins, and — all else equal — the *lightest*
-        model wins. "Is the model capable enough for a hard task?" is already handled
-        upstream by ``_apply_difficulty`` (capability-fit), which penalises only
-        under-powered models; this tier penalty does the complementary job of NOT
-        over-provisioning on easy tasks (don't pick a heavyweight when a lighter
-        model is equally suitable). Costs/tiers are normalised across the current
-        candidate set so the biases stay in suitability units. The result drives
-        selection AND the hysteresis (EMA / margin) downstream.
+        model wins. ``cost_relax = 1 - difficulty`` scales how hard those penalties
+        bite by the task's difficulty: on EASY tasks cost/tier matter fully (don't
+        over-provision — pick the cheapest light model that is suitable); on HARD
+        tasks the penalties shrink toward zero so a clearly-more-capable premium
+        model is allowed to win. This complements ``_apply_difficulty`` (which only
+        penalises UNDER-powered models): together they make difficulty the single
+        knob that trades cost for capability.
+
+        We scale by difficulty and deliberately NOT by each model's own suitability:
+        scaling by ``(1 - suitability)`` zeroes the cost penalty for any model the
+        classifier rates a perfect fit, so an expensive cloud model would always beat
+        an equally-suitable free local one — defeating the cost preference. When the
+        classifier gave no difficulty (parse failure / heuristic fallback) the
+        penalties apply in full, so the deterministic re-ranking falls back to the
+        cheapest / lightest model. The result drives selection AND the hysteresis
+        (EMA / margin) downstream.
         """
         specs = {c.model: c for c in candidates}
         max_cost = max((c.cost for c in candidates), default=0.0) or 1.0
         max_tier = max((c.tier for c in candidates), default=0) or 1
+        difficulty = result.difficulty
+        cost_relax = (1.0 - difficulty) if difficulty is not None else 1.0
         adjusted: list[CandidateScore] = []
         for s in result.scores:
             spec = specs.get(s.model)
             if spec is None:
                 adjusted.append(s)
                 continue
-            penalty_factor = max(0.0, 1.0 - s.score)
-            effective = (
-                s.score
-                - (
-                    self._s.cost_bias * (spec.cost / max_cost)
-                    + self._s.tier_bias * (spec.tier / max_tier)
-                )
-                * penalty_factor
-            )
-            adjusted.append(CandidateScore(model=s.model, score=effective))
+            penalty = (
+                self._s.cost_bias * (spec.cost / max_cost)
+                + self._s.tier_bias * (spec.tier / max_tier)
+            ) * cost_relax
+            adjusted.append(CandidateScore(model=s.model, score=s.score - penalty))
         return ClassifierResult(scores=adjusted)
 
     def _select_best(

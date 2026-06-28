@@ -81,7 +81,7 @@ async def test_classifier_payload_includes_description_but_not_tier():
         seen["user"] = body["messages"][-1]["content"]
         payload = {
             "choices": [
-                {"message": {"content": _json.dumps({"difficulty": 0.5, "scores": []})}}
+                {"message": {"content": _json.dumps({"d": 0.5, "r": [0.1, 0.2]})}}
             ]
         }
         return httpx.Response(200, json=payload)
@@ -100,19 +100,42 @@ async def test_classifier_payload_includes_description_but_not_tier():
     req = ChatCompletionRequest(
         model="cobaiter-auto", messages=[{"role": "user", "content": "hi"}]
     )
-    await classifier.score(req, candidates)
-    assert "code generation and debugging" in seen["user"]
-    assert "general chat" in seen["user"]
-    catalog = _json.loads(seen["user"].split("Candidate models:\n", 1)[1].split("\n\n", 1)[0])
-    # Real model names are anonymised to opaque aliases (avoids brand bias) and the
-    # catalog carries description ONLY — tier/cost stay out of the classifier.
-    assert all(set(c.keys()) == {"model", "description"} for c in catalog)
+    result = await classifier.score(req, candidates)
+    # Descriptions reach the classifier as a numbered list (no JSON, no model ids):
+    # this anonymises brand (avoids bias) and keeps the prompt small.
+    assert "1. code generation and debugging" in seen["user"]
+    assert "2. general chat" in seen["user"]
+    # Real model names and tier values stay OUT of the classifier prompt.
     assert "m-coding" not in seen["user"] and "m-general" not in seen["user"]
-    assert all(c["model"].startswith("candidate-") for c in catalog)
+    assert "tier" not in seen["user"].lower()
     # The prompt asks for a difficulty estimate (consumed by the router's
     # capability-fit), not a final score.
     assert "difficulty" in seen["system"]
+    # ``r`` is parsed positionally back onto the candidates, ``d`` is the difficulty.
+    by = {s.model: s.score for s in result.scores}
+    assert by == {"m-coding": 0.1, "m-general": 0.2}
+    assert result.difficulty == 0.5
     await http.aclose()
+
+
+def test_digest_keeps_instruction_head_and_recent_tail():
+    """When the conversation exceeds the budget the digest must keep BOTH ends.
+
+    A title-generation request states its (trivial) action up-front and embeds the
+    real conversation as the body; a tail-only digest would hide that action and
+    show only the embedded (possibly hard) content, inflating the difficulty
+    estimate. Keeping the head preserves the actual instruction."""
+    from cobaiter.classifier import _digest_conversation
+
+    head_instruction = "Generate a concise 3-5 word title for the following chat"
+    tail_marker = "MOST_RECENT_LINE"
+    messages = [
+        {"role": "user", "content": head_instruction + " " + ("filler " * 500) + tail_marker}
+    ]
+    digest = _digest_conversation(messages, limit=300)
+    assert "title" in digest  # the up-front action survives
+    assert tail_marker in digest  # the recent tail survives
+    assert len(digest) <= 300 + len("\n…\n")
 
 
 # --- Valkey state-store failure ------------------------------------------ #

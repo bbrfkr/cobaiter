@@ -59,6 +59,44 @@ def test_capability_fit_penalises_underpowered_on_hard_task(engine):
     assert abs(out["gen-no-think"] - 1 / 3) < 1e-9
 
 
+def test_cost_penalty_applies_even_at_full_suitability(engine):
+    """Regression: a perfect-fit (suitability 1.0) expensive cloud model must still
+    pay a cost penalty, so an equally-suitable free local model wins. The old
+    ``* (1 - suitability)`` scaling zeroed the penalty at suitability 1.0, letting
+    the pricey model always win."""
+    candidates = [
+        ModelSpec(model="cloud", tier=3, cost=5.0, is_local=False, description="general"),
+        ModelSpec(model="local", tier=3, cost=0.0, is_local=True, description="general"),
+    ]
+    result = ClassifierResult(
+        scores=[
+            CandidateScore(model="cloud", score=1.0),
+            CandidateScore(model="local", score=1.0),
+        ],
+        difficulty=0.3,
+    )
+    out = {s.model: s.score for s in engine._adjust_scores(result, candidates).scores}
+    assert out["cloud"] < 1.0  # penalised despite the perfect fit
+    assert out["local"] > out["cloud"]  # free local wins the tie on cost
+
+
+def test_high_difficulty_relaxes_cost_penalty(engine):
+    """The cost/tier penalty shrinks as difficulty rises, so a premium model keeps
+    more of its suitability on hard tasks (where paying for capability is justified)."""
+    candidates = [
+        ModelSpec(model="cloud", tier=3, cost=5.0, is_local=False, description="general"),
+    ]
+    easy = engine._adjust_scores(
+        ClassifierResult(scores=[CandidateScore(model="cloud", score=1.0)], difficulty=0.2),
+        candidates,
+    ).scores[0].score
+    hard = engine._adjust_scores(
+        ClassifierResult(scores=[CandidateScore(model="cloud", score=1.0)], difficulty=0.9),
+        candidates,
+    ).scores[0].score
+    assert hard > easy
+
+
 async def test_single_candidate_is_deterministic_rule(engine, classifier):
     """Privacy constraint leaves only the local model -> RULE, no classifier call."""
     req = user_req("secret stuff", metadata={"privacy": True})

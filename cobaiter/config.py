@@ -36,10 +36,18 @@ class Settings(BaseSettings):
     virtual_model: str = "cobaiter-auto"
     # Lightweight model used to score candidate models when more than one remains.
     classifier_model: str = "claude-haiku-4-5"
-    # Max completion tokens for a classifier call. Must be large enough for
-    # "thinking" classifier models to finish reasoning AND emit the JSON verdict
-    # (a too-small value truncates before the JSON, forcing the heuristic fallback).
-    classifier_max_tokens: int = 2048
+    # Max completion tokens for a classifier call. The classifier emits a tiny JSON
+    # verdict ({"d":<float>,"r":[<float>,...]}), so this only needs slack for that.
+    # Keep reasoning DISABLED on the classifier model (e.g. enable_thinking:false):
+    # a "thinking" model spends tokens (and seconds) reasoning before the JSON, which
+    # both slows the call and can truncate the verdict.
+    classifier_max_tokens: int = 512
+    # Max characters of recent conversation shown to the classifier. The classifier
+    # only needs the latest request to judge difficulty + domain, so this is kept
+    # small: the conversation digest is the dominant contributor to classifier INPUT
+    # tokens (prefill), and a large value makes every classifier call slower for no
+    # routing gain.
+    classifier_digest_chars: int = 400
     # Safe fallback when no candidate satisfies the constraints.
     default_model: str = "claude-haiku-4-5"
 
@@ -57,13 +65,21 @@ class Settings(BaseSettings):
     # --- Cost / tier aware selection ---
     # The classifier returns a use-case *relevance* (0..1) plus one task *difficulty*.
     # The router first folds difficulty + tier into a capability-fit (penalising only
-    # UNDER-powered models), then re-ranks deterministically with two PENALTIES:
-    #     effective = suitability - cost_bias*(cost/maxCost) - tier_bias*(tier/maxTier)
+    # UNDER-powered models), then re-ranks deterministically with two PENALTIES that
+    # are themselves relaxed on hard tasks:
+    #     effective = suitability
+    #               - (cost_bias*(cost/maxCost) + tier_bias*(tier/maxTier)) * (1 - difficulty)
     # Both favour the cheapest, *lightest* model that is still suitable. "High tier
     # wins on hard tasks" is already handled by capability-fit, so tier here is a
     # penalty, NOT a bonus: its job is to avoid over-provisioning on easy tasks (do
-    # not pick a heavyweight when a lighter model is equally suitable). ``cost_bias``
-    # should dominate ``tier_bias`` ("decide on cost, then weight").
+    # not pick a heavyweight when a lighter model is equally suitable). The
+    # ``(1 - difficulty)`` factor makes difficulty the single knob trading cost for
+    # capability: easy tasks pay full cost/tier penalty (cheap light model wins),
+    # hard tasks relax it (a clearly-more-capable premium model may win). Scaling by
+    # difficulty rather than by each model's own suitability is deliberate — the
+    # latter zeroes the penalty for any perfect-fit model, letting an expensive cloud
+    # model always beat an equally-suitable free local one. ``cost_bias`` should
+    # dominate ``tier_bias`` ("decide on cost, then weight").
     cost_bias: float = 0.4
     tier_bias: float = 0.1
     # Capability-fit normalises a candidate's tier against the MAX tier — but only
