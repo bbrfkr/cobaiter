@@ -82,7 +82,10 @@ compose では `models.yaml` をコンテナにマウントします。**この�
 # models.yaml
 models:
   - model: bbrfkr-llm-general          # LiteLLM が公開する実モデル名
-    description: 汎用の対話・推論・文章作成向け  # このモデルの「用途」のみ（分類器に渡る）
+    description: 汎用の対話・推論・文章作成向け  # このモデルの「用途」のみ（task_examples 未設定時のフォールバック）
+    task_examples:                     # 代表的なタスク文（設定時はこちらが relevance のスコアリング対象）
+      - この文章を要約してほしい
+      - 旅行のプランについて相談したい
     cost: 0                            # 相対コスト（USD/Mtok 目安、ローカル=0）
     tier: 2                            # 能力レベル（整数・大きいほど高性能/低速）
     context_window: 262144
@@ -93,18 +96,27 @@ models:
   # ... 以降、運用するモデルを列挙
 ```
 
-**関心の分離**がこのスキーマの肝です。`description` は各モデルの**用途のみ**を表す自由文で、
+**関心の分離**がこのスキーマの肝です。`description`/`task_examples` は各モデルの**用途のみ**を表す自由文で、
 ルーティング時に 2 軸のスコアを**LLM 生成なし**で算出します:
 
-- **`relevance`（0..1）** … 会話ダイジェストの embedding と各候補 `description` の embedding の
-  **cosine 類似度**。最良候補を 1.0 に固定し、類似度が `COBAITER_EMBEDDING_REL_BAND`（既定 0.10）
-  下回るごとに 0.0 へ落とすコントラスト正規化を行う（生 cosine は圧縮帯域に張り付くため）。
-  description ベクトルはプロセス内キャッシュされ、定常状態では**リクエストあたり embedding 1 コール
-  （ダイジェストのみ）**で済む。
-- **`difficulty`（0..1）** … 決定的なヒューリスティック。入力トークン数を基底に、指示部
-  （system 冒頭＋最新 user メッセージの先頭/末尾）の意図キーワード（設計/原因調査/実装/レビュー
-  などで加点）、エラー・スタックトレース痕跡、code fence で加点。タイトル生成・要約・翻訳・抽出
-  などの**メタタスク語が指示部にあれば、埋め込まれた本文がどれだけ難しくても低難度（0.15）に固定**。
+- **`relevance`（0..1）** … 会話ダイジェストの embedding と各候補の参照テキストの embedding の
+  **top-2-mean cosine 類似度**。参照テキストは `task_examples` が設定されていればその全件、未設定なら
+  `description` を1件のリストとして扱う（`task_examples` が空の場合は旧来の単一ベクトル比較と完全に
+  同じ挙動）。複数 example の上位2件の平均を取ることで、1本の example の言い回しのブレ（埋め込みモデルは
+  短い日本語文の些細な違いに敏感 — 句点の有無だけで類似度が有意にずれることを実測済み）を緩和しつつ、
+  「example 数が多いドメインほど有利になる」比較上のバイアスも抑える。最良候補を 1.0 に固定し、類似度が
+  `COBAITER_EMBEDDING_REL_BAND`（既定 0.10）下回るごとに 0.0 へ落とすコントラスト正規化を行う（生 cosine は
+  圧縮帯域に張り付くため）。参照テキストのベクトルはプロセス内キャッシュされ、定常状態では**リクエストあたり
+  embedding 1 コール（ダイジェストのみ）**で済む。`task_examples` を新規導入・大幅追加すると raw cosine の
+  分布が変わりうるため、band の再較正（後述）も併せて回すことを推奨する。
+- **`difficulty`（0..1）** … タイトル生成・要約・翻訳・抽出などの**メタタスク語（LOW_INTENT キーワード）が
+  指示部（system 冒頭＋最新 user メッセージの先頭/末尾）にあれば、埋め込まれた本文がどれだけ難しくても
+  低難度（0.15）に決定的に固定**（最優先でチェック）。それ以外は embedding ベース: 会話ダイジェストが
+  「易しいタスク」「難しいタスク」の2つの固定 exemplar 集合（数学・コーディング・科学・法律など複数ドメイン
+  にまたがる）とどれだけ似ているか（`sim_hard / (sim_hard + sim_easy)`）を計算し、
+  `COBAITER_DIFFICULTY_EASY_ANCHOR`/`_HARD_ANCHOR` で 0.15〜0.85 にrescale。エラー・スタックトレース痕跡で
+  `+0.05`、code fence で `+0.03` の小さな加点が乗る。トークン数だけを見る粗いフォールバック
+  （`_fallback_difficulty`）は、embedding 呼び出し自体が失敗した場合の最終手段としてのみ使われる。
 
 続く連続値の算術は**ルーターのコード**が決定的に合成します。まず能力適合を作り、続いて cost/tier を再ランキング:
 
@@ -150,11 +162,14 @@ cost/tier ペナルティは `(1 − difficulty)` でスケールします。**�
 Stream（`cobaiter:decisions`）に記録し、オフラインの `cobaiter-calibrate` コマンドで再キャリブレーションを
 支援します。
 
-- **何を記録するか**: 会話キー・ターン・route・選定モデル・difficulty、および各候補への raw cosine
-  類似度と difficulty exemplar への類似度（`sim_easy`/`sim_hard`）。プライバシー会話（`needs_local`）では
-  タスク本文（`task_text`）を必ず `None` に落とし、cosine 等の非テキストシグナルのみ残します。
-  `COBAITER_DECISION_LOG_ENABLED=false` で無効化、`COBAITER_DECISION_LOG_MAXLEN` で Stream の上限
-  （近似トリム）を指定できます。記録は best-effort — Valkey 書き込みに失敗してもルーティング自体は失敗しません。
+- **何を記録するか**: 会話キー・ターン・route・選定モデル・difficulty、各候補への raw cosine 類似度
+  （`candidate_sims`）、各候補が実際に比較に使った**解決済み参照テキスト**（`candidate_refs` — `task_examples`
+  またはそのフォールバックの `description`。レジストリのメタデータであり会話本文ではないため、privacy会話でも
+  redact されない）、difficulty exemplar への類似度（`sim_easy`/`sim_hard`）。プライバシー会話（`needs_local`）
+  ではタスク本文（`task_text`）のみ必ず `None` に落とします。`COBAITER_DECISION_LOG_ENABLED=false` で無効化、
+  `COBAITER_DECISION_LOG_MAXLEN` で Stream の上限（近似トリム）を指定できます。記録は best-effort —
+  Valkey 書き込みに失敗してもルーティング自体は失敗しません。`task_examples` を広く使うようになった場合、
+  1エントリのサイズが伸びるため `COBAITER_DECISION_LOG_MAXLEN` の引き下げも検討してください。
 - **再キャリブレーション**: `COBAITER_CALIBRATION_JUDGE_MODEL` に judge 用モデルを設定した上で
 
   ```bash
@@ -162,11 +177,26 @@ Stream（`cobaiter:decisions`）に記録し、オフラインの `cobaiter-cali
   # あるいは: uv run python -m cobaiter.calibrate
   ```
 
-  を実行すると、ログから最大 `COBAITER_CALIBRATION_SAMPLE_SIZE` 件をサンプリングし、各タスク本文を
-  judge モデルに投げて 0..1 の難易度ラベルを取得、既存の `sim_easy`/`sim_hard` 比率に対して最小二乗で
-  線形回帰し、`difficulty_easy_anchor`/`hard_anchor` の推奨値と RMSE（現行 vs 推奨）をレポートします。
-  あわせて、候補間の raw cosine 類似度差が `COBAITER_EMBEDDING_REL_BAND` 未満だった「際どい」ルーティング
-  判断も一覧表示するので、relevance 側（description の書き方や band）の見直し材料になります。
+  を実行すると、ログから最大 `COBAITER_CALIBRATION_SAMPLE_SIZE` 件をサンプリングし、以下の2軸を再較正します:
+
+  - **difficulty**: 各タスク本文を judge モデルに投げて 0..1 の難易度ラベルを取得し、既存の
+    `sim_easy`/`sim_hard` 比率に対して最小二乗で線形回帰、`difficulty_easy_anchor`/`hard_anchor` の推奨値と
+    RMSE（現行 vs 推奨）をレポートします。
+  - **relevance band**: `candidate_refs` が完全一致する候補を1つの「ドメイン」としてグルーピングし
+    （think/no-think のような同一ドメイン内の tier 違いを judge に区別させないため）、judge にタスク本文と
+    各ドメインの参照テキストを見せてどのドメインが正しいか判定させます。ただし `embedding_rel_band` は
+    `relevance_from_sims` の性質上、**raw cosine が最大の候補を常に relevance 1.0 にする**ため、band の値を
+    変えても「どのドメインが勝つか」は変わりません（band で直せるのは relevance の誤判定ではなく、
+    description/task_examples の書き方の問題です）。band が実際にコントロールするのは「正解ドメインが
+    既に raw top を取れているときに、他のドメインをどれだけ確実に抑え込めるか」なので、再較正は
+    「judge が正解だと言ったドメインが raw top と一致した」サンプルだけを対象に、**全サンプルで
+    誤ドメインの suitability 相当値が 0.5（分類器のニュートラル値）以下に収まる、最大の band 値**を探索します
+    （difficulty のような RMSE 回帰ではなく、band は raw top 自体を変えないため grid search + 安全率が
+    適切な指標です）。レポートには band 非依存の `raw top-pick accuracy`（relevance がそもそも正しいドメインを
+    最上位に選べている割合）も出るので、これが低い場合は band ではなく `description`/`task_examples` の
+    見直しが必要というシグナルになります。あわせて、候補間の raw cosine 類似度差が
+    `COBAITER_EMBEDDING_REL_BAND` 未満だった「際どい」ルーティング判断の一覧に、judge の判定
+    （どのドメインが正解でルーターと一致したか）を付記して表示します。
 - **意図的に自動適用しない**: judge 呼び出しは同期 LLM 生成そのもの（分類器が embedding 方式に置き換えた
   レイテンシコスト）なので、このツールはリクエストのホットパスには一切乗らず、常にオフラインでバッチ実行
   します。またルーター自身の誤判定がそのまま「正解」として再学習に混入するフィードバックループを避けるため、
@@ -272,6 +302,18 @@ curl -s -D- localhost:8000/v1/chat/completions \
 ```bash
 uv run pytest
 ```
+
+`tests/test_classifier.py` 等は決定的なフェイク embedding 空間を使うため、実際の embedding モデルとは
+無関係に高速・オフラインで実行できます。実際の `models.yaml`（本番レジストリ）と実 embedding モデルに対する
+回帰テスト（golden set、`tests/fixtures/routing_cases.yaml`）は別途用意されており、デフォルトでは skip されます:
+
+```bash
+docker compose up -d valkey litellm   # または COBAITER_LITELLM_BASE_URL を既存環境に向ける
+COBAITER_RUN_GOLDEN=1 uv run pytest -m golden -v
+```
+
+`models.yaml` の description/task_examples・embedding モデル・`COBAITER_EMBEDDING_REL_BAND` や difficulty
+アンカーを変更したときは、このgolden setを実行してルーティング結果が壊れていないか確認してください。
 
 ## 留意点
 

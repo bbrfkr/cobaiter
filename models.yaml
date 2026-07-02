@@ -8,13 +8,14 @@
 #   model           : the exact model name as exposed by LiteLLM (/v1/models)
 #   description     : free-text USE-CASE DOMAIN ONLY — what subject / kind of task
 #                     this model is for (e.g. software-development vs non-coding
-#                     general use). This text is EMBEDDED and compared (cosine
-#                     similarity) against the conversation digest to score TOPIC
-#                     relevance. Do NOT mention difficulty or capability ("hard",
-#                     "advanced", "複雑", "高難度", "low-difficulty"), cost, speed,
-#                     or INPUT LENGTH: difficulty is estimated separately (one
-#                     per-task heuristic) and matched against `tier` in code, and
-#                     non-domain wording only blurs the embedding similarity.
+#                     general use). Used only as a FALLBACK when `task_examples`
+#                     is empty (see below); kept as a human-readable summary of
+#                     the domain even when `task_examples` is set. Do NOT mention
+#                     difficulty or capability ("hard", "advanced", "複雑",
+#                     "高難度", "low-difficulty"), cost, speed, or INPUT LENGTH:
+#                     difficulty is estimated separately (one per-task heuristic)
+#                     and matched against `tier` in code, and non-domain wording
+#                     only blurs the embedding similarity.
 #                     Models that SHARE a domain (e.g. a think/no-think pair, or
 #                     several coding models) should share the SAME description —
 #                     they then tie on relevance — and let `tier`/`cost`
@@ -33,6 +34,22 @@
 #                     stand alone: don't reference or contrast against other
 #                     domains by name, since new domains are expected to be added
 #                     over time and cross-references don't scale past two.
+#   task_examples   : short, representative task phrases for this model's domain
+#                     (same content rules as `description` above: positively
+#                     stated, domain-only, shared across a domain's tier
+#                     variants). When set, relevance is scored as the top-2-mean
+#                     cosine similarity between the conversation digest and EACH
+#                     example (multi-prototype matching) instead of a single
+#                     description vector — this lets one domain cover several
+#                     distinct sub-tasks (e.g. coding: bugfix / review / design /
+#                     CI investigation) without a single sentence having to carry
+#                     all of them, and damps per-example embedding brittleness
+#                     (short JP text can be sensitive to minor phrasing). When
+#                     empty, relevance falls back to `description` as a single
+#                     one-item example. Target 3-6 examples per model group, and
+#                     keep counts roughly even ACROSS domains — an uneven count
+#                     (one domain with many examples, another with few) statistically
+#                     biases relevance toward whichever domain has more examples.
 #   cost            : relative monetary cost (e.g. USD per 1M tokens). Local = 0.
 #                     The router prefers cheaper models unless a pricier one is
 #                     clearly more suitable.
@@ -55,6 +72,13 @@
 models:
   - model: gpt-5.5
     description: "雑談・日常会話・質問応答。文章作成・要約・翻訳・校正・タイトル作成。数学や論理を含む一般的な推論、時事や雑学の相談、旅行・レシピ・買い物などの相談ごと。"
+    task_examples:
+      - "今日の天気について雑談したい"
+      - "この文章を要約してほしい"
+      - "この英語の文章を日本語に翻訳してほしい"
+      - "旅行のプランについて相談したい"
+      - "簡単な数学の問題を解いてほしい"
+      - "この文章の誤字脱字を校正してほしい"
     cost: 5
     tier: 6
     context_window: 262144
@@ -65,6 +89,13 @@ models:
 
   - model: bbrfkr-llm-general
     description: "雑談・日常会話・質問応答。文章作成・要約・翻訳・校正・タイトル作成。数学や論理を含む一般的な推論、時事や雑学の相談、旅行・レシピ・買い物などの相談ごと。"
+    task_examples:
+      - "今日の天気について雑談したい"
+      - "この文章を要約してほしい"
+      - "この英語の文章を日本語に翻訳してほしい"
+      - "旅行のプランについて相談したい"
+      - "簡単な数学の問題を解いてほしい"
+      - "この文章の誤字脱字を校正してほしい"
     cost: 0
     tier: 3
     context_window: 262144
@@ -75,6 +106,13 @@ models:
 
   - model: bbrfkr-llm-general-no-think
     description: "雑談・日常会話・質問応答。文章作成・要約・翻訳・校正・タイトル作成。数学や論理を含む一般的な推論、時事や雑学の相談、旅行・レシピ・買い物などの相談ごと。"
+    task_examples:
+      - "今日の天気について雑談したい"
+      - "この文章を要約してほしい"
+      - "この英語の文章を日本語に翻訳してほしい"
+      - "旅行のプランについて相談したい"
+      - "簡単な数学の問題を解いてほしい"
+      - "この文章の誤字脱字を校正してほしい"
     cost: 0
     tier: 1
     context_window: 262144
@@ -85,6 +123,13 @@ models:
 
   - model: claude-sonnet-5
     description: "ソフトウェア開発・プログラミング全般。コード生成・コードレビュー・リファクタリング・デバッグ・バグ修正。システムやアーキテクチャの技術設計、インフラ運用・CI/CD・障害調査、ライブラリやAPIの使い方相談。"
+    task_examples:
+      - "このコードのバグを直してほしい"
+      - "この関数をレビューしてほしい"
+      - "システムのアーキテクチャ設計についてアドバイスがほしい"
+      - "CI/CDパイプラインの障害を調査してほしい"
+      - "このライブラリの使い方を教えてほしい"
+      - "このコードをリファクタリングしてほしい"
     cost: 2
     tier: 5
     context_window: 262144
@@ -95,6 +140,13 @@ models:
 
   - model: bbrfkr-llm-coding
     description: "ソフトウェア開発・プログラミング全般。コード生成・コードレビュー・リファクタリング・デバッグ・バグ修正。システムやアーキテクチャの技術設計、インフラ運用・CI/CD・障害調査、ライブラリやAPIの使い方相談。"
+    task_examples:
+      - "このコードのバグを直してほしい"
+      - "この関数をレビューしてほしい"
+      - "システムのアーキテクチャ設計についてアドバイスがほしい"
+      - "CI/CDパイプラインの障害を調査してほしい"
+      - "このライブラリの使い方を教えてほしい"
+      - "このコードをリファクタリングしてほしい"
     cost: 0
     tier: 3
     context_window: 262144
@@ -105,6 +157,13 @@ models:
 
   - model: bbrfkr-llm-coding-no-think
     description: "ソフトウェア開発・プログラミング全般。コード生成・コードレビュー・リファクタリング・デバッグ・バグ修正。システムやアーキテクチャの技術設計、インフラ運用・CI/CD・障害調査、ライブラリやAPIの使い方相談。"
+    task_examples:
+      - "このコードのバグを直してほしい"
+      - "この関数をレビューしてほしい"
+      - "システムのアーキテクチャ設計についてアドバイスがほしい"
+      - "CI/CDパイプラインの障害を調査してほしい"
+      - "このライブラリの使い方を教えてほしい"
+      - "このコードをリファクタリングしてほしい"
     cost: 0
     tier: 1
     context_window: 262144

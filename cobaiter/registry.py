@@ -17,6 +17,9 @@ Expected shape (YAML)::
     models:
       - model: bbrfkr-llm-general
         description: general-purpose chat and reasoning
+        task_examples:
+          - "summarize this article"
+          - "help me plan a trip"
         cost: 0
         tier: 2
         context_window: 32768

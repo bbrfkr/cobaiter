@@ -29,6 +29,29 @@ models:
     is_local: true
 """
 
+_YAML_WITH_TASK_EXAMPLES = """
+models:
+  - model: bbrfkr-llm-general
+    cost: 0
+    tier: 2
+    description: "general-purpose chat and reasoning"
+    task_examples:
+      - "summarize this article"
+      - "help me plan a trip"
+    context_window: 32768
+    multimodal: true
+    supports_tools: true
+    is_local: true
+    fallback_chain: [bbrfkr-llm-general-no-think]
+  - model: bbrfkr-llm-general-no-think
+    cost: 0
+    tier: 1
+    context_window: 32768
+    multimodal: false
+    supports_tools: true
+    is_local: true
+"""
+
 
 def test_load_registry_from_yaml(tmp_path):
     f = tmp_path / "models.yaml"
@@ -43,6 +66,20 @@ def test_load_registry_from_yaml(tmp_path):
     assert by["bbrfkr-llm-general-no-think"].multimodal is False
     # description is optional: entries that omit it default to empty string.
     assert by["bbrfkr-llm-general-no-think"].description == ""
+    # task_examples is optional too: entries that omit it default to an empty
+    # list (relevance falls back to `description`; see classifier.py).
+    assert by["bbrfkr-llm-general"].task_examples == []
+    assert by["bbrfkr-llm-general-no-think"].task_examples == []
+
+
+def test_load_registry_reads_task_examples(tmp_path):
+    f = tmp_path / "models.yaml"
+    f.write_text(_YAML_WITH_TASK_EXAMPLES)
+    specs = load_model_registry(f)
+    by = {s.model: s for s in specs}
+    assert by["bbrfkr-llm-general"].task_examples == [
+        "summarize this article", "help me plan a trip",
+    ]
 
 
 def test_missing_config_raises(tmp_path):

@@ -17,6 +17,7 @@ def _entry(turn: int, *, task_text: str = "hi") -> DecisionLogEntry:
         diagnostics=ClassifierDiagnostics(
             task_text=task_text,
             candidate_sims={"m-a": 0.9, "m-b": 0.3},
+            candidate_refs={"m-a": ["fix this bug"], "m-b": ["plan a trip"]},
             sim_easy=0.2,
             sim_hard=0.6,
         ),
@@ -35,6 +36,9 @@ async def test_log_decision_round_trips_via_read_decisions(store):
     assert entries[0].diagnostics is not None
     assert entries[0].diagnostics.task_text == "hi"
     assert entries[0].diagnostics.candidate_sims == {"m-a": 0.9, "m-b": 0.3}
+    assert entries[0].diagnostics.candidate_refs == {
+        "m-a": ["fix this bug"], "m-b": ["plan a trip"],
+    }
     assert entries[0].diagnostics.sim_easy == 0.2
     assert entries[0].diagnostics.sim_hard == 0.6
 
