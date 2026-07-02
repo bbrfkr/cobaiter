@@ -211,7 +211,13 @@ async def _judge_difficulty(client: LiteLLMClient, model: str, task_text: str) -
                 {"role": "system", "content": _JUDGE_SYSTEM},
                 {"role": "user", "content": task_text},
             ],
-            "temperature": 0,
+            # No explicit temperature: some judge models (e.g. reasoning-style
+            # models like gpt-5.5) reject any non-default value outright
+            # (litellm's drop_params only strips UNSUPPORTED params, not
+            # unsupported VALUES of an otherwise-supported one, so this must
+            # be omitted rather than set to 0). Determinism isn't critical
+            # here — this is an offline batch job aggregating over many
+            # samples, not a single decisive call.
         })
         content = resp["choices"][0]["message"]["content"]
     except (DownstreamError, KeyError, IndexError, TypeError) as exc:
@@ -259,7 +265,8 @@ async def _judge_relevance(
                 {"role": "system", "content": _JUDGE_RELEVANCE_SYSTEM},
                 {"role": "user", "content": f"task:\n{task_text}\n\ndomains:\n{domains}"},
             ],
-            "temperature": 0,
+            # See _judge_difficulty: no explicit temperature, some judge
+            # models reject any non-default value.
         })
         content = resp["choices"][0]["message"]["content"]
     except (DownstreamError, KeyError, IndexError, TypeError) as exc:
