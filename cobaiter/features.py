@@ -46,9 +46,9 @@ def conversation_key(req: ChatCompletionRequest, header_id: str | None) -> str:
 
 
 def _fingerprint(req: ChatCompletionRequest) -> str:
-    system = " ".join(_text(m) for m in req.messages if m.get("role") == "system")
+    system = " ".join(message_text(m) for m in req.messages if m.get("role") == "system")
     first_user = next(
-        (_text(m) for m in req.messages if m.get("role") == "user"), ""
+        (message_text(m) for m in req.messages if m.get("role") == "user"), ""
     )
     norm = (system.strip() + "\n␟\n" + first_user.strip()).lower()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
@@ -102,11 +102,11 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     total = 0
     for m in messages:
         total += 4
-        total += len(_ENCODER.encode(_text(m)))
+        total += len(_ENCODER.encode(message_text(m)))
     return total
 
 
-def _text(message: dict[str, Any]) -> str:
+def message_text(message: dict[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
         return content
@@ -124,7 +124,7 @@ def _text(message: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 def count_code_blocks(messages: list[dict[str, Any]]) -> int:
     """Number of code fences across the whole conversation (an even count = N blocks)."""
-    fences = sum(len(_CODE_FENCE.findall(_text(m))) for m in messages)
+    fences = sum(len(_CODE_FENCE.findall(message_text(m))) for m in messages)
     return fences // 2
 
 

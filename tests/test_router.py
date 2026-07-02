@@ -54,9 +54,75 @@ def test_capability_fit_penalises_underpowered_on_hard_task(engine):
         difficulty=1.0,
     )
     out = {s.model: s.score for s in engine._apply_difficulty(result, candidates).scores}
-    # gen-no-think: 1 - (1.0 - 1/3) = 0.333...; gen-think (tier3 == maxTier): 1.0.
+    # gen-no-think: 1 - (1.0**curve - 1/3) = 0.333...; gen-think (tier3==maxTier): 1.0.
+    # difficulty=1.0 is the curve's fixed point (1**curve == 1), so this boundary
+    # value is unaffected by capability_curve.
     assert out["gen-think"] == 1.0
     assert abs(out["gen-no-think"] - 1 / 3) < 1e-9
+
+
+def _general_trio_with_distant_cloud() -> list[ModelSpec]:
+    """A same-DOMAIN no-think/think pair plus a much higher-tier cloud escalation
+    target (unlike ``_general_pair_plus_coding``, the tier-6 model here is fully
+    relevant, not out-of-domain — it legitimately sets maxTier)."""
+    return [
+        ModelSpec(model="gen-no-think", tier=1, description="general"),
+        ModelSpec(model="gen-think", tier=3, description="general"),
+        ModelSpec(model="gen-cloud", tier=6, description="general"),
+    ]
+
+
+def test_capability_curve_keeps_no_think_unpenalised_at_low_difficulty(engine):
+    """Regression: a distant in-domain escalation target (tier 6) must not hijack
+    the LOCAL no-think(1)/think(3) comparison at low difficulty. With the linear
+    (curve=1) formula, maxTier=6 makes even a trivial task (difficulty 0.25) look
+    like it needs more than tier 1 (1/6 ~= 0.167 < 0.25). capability_curve=2 delays
+    that onset (0.25**2 = 0.0625 < 0.167), leaving no-think fully un-penalised so
+    the cost/tier re-ranking's existing lighter-wins preference can pick it."""
+    candidates = _general_trio_with_distant_cloud()
+    result = ClassifierResult(
+        scores=[CandidateScore(model=c.model, score=1.0) for c in candidates],
+        difficulty=0.25,
+    )
+    out = {s.model: s.score for s in engine._apply_difficulty(result, candidates).scores}
+    assert out["gen-no-think"] == 1.0
+    assert out["gen-think"] == 1.0
+
+
+def test_capability_curve_still_escalates_to_cloud_on_hard_task(engine):
+    """The curve must not weaken escalation for genuinely hard tasks: at
+    difficulty=1.0 the exponent is a no-op (1**curve == 1), so the distant cloud
+    tier still dominates and the local models are penalised same as before."""
+    candidates = _general_trio_with_distant_cloud()
+    result = ClassifierResult(
+        scores=[CandidateScore(model=c.model, score=1.0) for c in candidates],
+        difficulty=1.0,
+    )
+    out = {s.model: s.score for s in engine._apply_difficulty(result, candidates).scores}
+    assert out["gen-cloud"] == 1.0
+    assert abs(out["gen-think"] - (1 - (1.0 - 3 / 6))) < 1e-9
+    assert abs(out["gen-no-think"] - (1 - (1.0 - 1 / 6))) < 1e-9
+    assert out["gen-no-think"] < out["gen-think"] < out["gen-cloud"]
+
+
+async def test_trivial_greeting_prefers_lightest_local_model(engine, classifier):
+    """End-to-end: with a distant cloud escalation target sharing the domain, a
+    plain greeting must still route to the lightest (no-think) local model, not
+    the mid-tier think model — the original bug report this fix addresses.
+    ``difficulty=0.25`` mirrors what the heuristic assigns a short non-meta
+    message like "こんにちは" (see ``classifier.EmbeddingClassifier._difficulty``,
+    fallback path)."""
+    candidates = [
+        ModelSpec(model="cloud-general", tier=6, cost=5.0, description="general"),
+        ModelSpec(model="local-think", tier=3, cost=0.0, is_local=True, description="general"),
+        ModelSpec(model="local-no-think", tier=1, cost=0.0, is_local=True, description="general"),
+    ]
+    for spec in candidates:
+        await engine._store.put_model(spec)
+    classifier.table = {c.model: 1.0 for c in candidates}
+    classifier.difficulty = 0.25
+    d = await engine.decide(user_req("こんにちは"), header_id="greet-1")
+    assert d.model == "local-no-think"
 
 
 def test_cost_penalty_applies_even_at_full_suitability(engine):

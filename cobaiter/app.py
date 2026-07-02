@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from redis.exceptions import RedisError
 
-from .classifier import Classifier
+from .classifier import EmbeddingClassifier
 from .config import Settings, get_settings
 from .features import CONV_ID_HEADER, PRIVACY_HEADER, extract_constraints
 from .litellm_client import DownstreamError, LiteLLMClient
@@ -49,7 +49,7 @@ def create_app(
     settings: Settings | None = None,
     store: Store | None = None,
     client: LiteLLMClient | None = None,
-    classifier: Classifier | None = None,
+    classifier: EmbeddingClassifier | None = None,
     seed: bool = True,
 ) -> FastAPI:
     settings = settings or get_settings()
@@ -60,7 +60,9 @@ def create_app(
         app.state.settings = settings
         app.state.store = store or Store.from_url(settings)
         app.state.client = client or LiteLLMClient.create(settings)
-        app.state.classifier = classifier or Classifier(app.state.client, settings)
+        app.state.classifier = classifier or EmbeddingClassifier(
+            app.state.client, settings
+        )
         app.state.engine = RouteEngine(
             app.state.store, app.state.client, app.state.classifier, settings
         )

@@ -5,11 +5,10 @@ from __future__ import annotations
 import fakeredis.aioredis as fakeaioredis
 import pytest
 
-from cobaiter.classifier import Classifier
 from cobaiter.config import Settings
 from cobaiter.litellm_client import DownstreamError
 from cobaiter.router import RouteEngine
-from cobaiter.schemas import CandidateScore, ClassifierResult
+from cobaiter.schemas import CandidateScore, ClassifierDiagnostics, ClassifierResult
 from cobaiter.store import Store, default_seed_specs
 
 
@@ -60,6 +59,12 @@ class FakeClassifier:
     def __init__(self, table: dict[str, float] | None = None) -> None:
         self.table = table or {}
         self.calls = 0
+        # None (default) mirrors the "no usable estimate" case: the router skips
+        # capability-fit entirely. Set to a float to exercise it in a test.
+        self.difficulty: float | None = None
+        # None (default) mirrors "nothing to log" (see EmbeddingClassifier.score);
+        # set to a ClassifierDiagnostics to exercise decision logging in a test.
+        self.raw: ClassifierDiagnostics | None = None
 
     async def score(self, req, candidates):
         self.calls += 1
@@ -69,7 +74,9 @@ class FakeClassifier:
             scores=[
                 CandidateScore(model=c.model, score=self.table.get(c.model, 0.0))
                 for c in candidates
-            ]
+            ],
+            difficulty=self.difficulty,
+            raw=self.raw,
         )
 
 

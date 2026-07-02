@@ -19,6 +19,13 @@ model_list:
       mode: responses
     litellm_params:
       model: chatgpt/gpt-5.3-codex-spark
+  # Embedding model used by cobaiter's relevance scoring (COBAITER_EMBEDDING_MODEL).
+  # Point it at any /v1/embeddings-capable backend (a local one keeps routing fast).
+  - model_name: text-embedding-3-small
+    model_info:
+      mode: embedding
+    litellm_params:
+      model: openai/text-embedding-3-small
 
 litellm_settings:
   drop_params: true
