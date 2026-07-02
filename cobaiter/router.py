@@ -13,8 +13,9 @@ app layer performs the downstream call and may report a failover back in (see
 from __future__ import annotations
 
 import logging
+import time
 
-from .classifier import Classifier
+from .classifier import EmbeddingClassifier
 from .config import Settings
 from .features import (
     conversation_key,
@@ -29,6 +30,7 @@ from .schemas import (
     ClassifierResult,
     Constraints,
     ConversationState,
+    DecisionLogEntry,
     ModelSpec,
     Route,
     RouteDecision,
@@ -47,7 +49,7 @@ class RouteEngine:
         self,
         store: Store,
         client: LiteLLMClient,
-        classifier: Classifier,
+        classifier: EmbeddingClassifier,
         settings: Settings,
     ) -> None:
         self._store = store
@@ -154,6 +156,9 @@ class RouteEngine:
         state = self._fresh_state(chosen.model, req, constraints)
         state.score_ema = best.score
         state.last_recheck_turn = state.turn
+        await self._log_decision(
+            key, state, constraints, Route.CLASSIFIER_SELECT, chosen.model, best.model, result,
+        )
         return RouteDecision(
             model=chosen.model, route=Route.CLASSIFIER_SELECT,
             conversation_key=key, state=state,
@@ -262,12 +267,18 @@ class RouteEngine:
         if switching:
             spec = eligible[best.model]
             self._switch_state(state, spec, best.score, req, constraints)
+            await self._log_decision(
+                key, state, constraints, Route.CONTEXT_SWITCH, spec.model, best.model, result,
+            )
             return RouteDecision(
                 model=spec.model, route=Route.CONTEXT_SWITCH,
                 conversation_key=key, state=state,
             )
 
         self._refresh_signals(state, req, constraints)
+        await self._log_decision(
+            key, state, constraints, Route.CLASSIFIER_SELECT, state.model, best.model, result,
+        )
         return RouteDecision(
             model=state.model, route=Route.CLASSIFIER_SELECT,
             conversation_key=key, state=state,
@@ -411,6 +422,46 @@ class RouteEngine:
         state.sig_token_band = _token_band(constraints.estimated_tokens)
 
     # ------------------------------------------------------------------ #
+    # Decision logging (offline recalibration input — see cobaiter.calibrate)
+    # ------------------------------------------------------------------ #
+    async def _log_decision(
+        self,
+        key: str,
+        state: ConversationState,
+        constraints: Constraints,
+        route: Route,
+        chosen_model: str,
+        best_model: str | None,
+        result: ClassifierResult,
+    ) -> None:
+        """Persist one classifier-driven decision for later offline recalibration.
+
+        Only called from the two call sites where the classifier actually ran
+        (initial multi-candidate routing, soft re-evaluation) — ``result.raw`` is
+        ``None`` when the embedding call itself failed, in which case there is no
+        raw signal worth logging. ``task_text`` is redacted for conversations
+        flagged privacy-sensitive: the whole point of ``needs_local`` is to keep
+        that text off of anything but the local model, and the decision log is no
+        exception.
+        """
+        if not self._s.decision_log_enabled or result.raw is None:
+            return
+        diagnostics = result.raw
+        if constraints.needs_local:
+            diagnostics = diagnostics.model_copy(update={"task_text": None})
+        entry = DecisionLogEntry(
+            ts=time.time(),
+            conversation_key=key,
+            turn=state.turn,
+            route=route.value,
+            chosen_model=chosen_model,
+            best_model=best_model,
+            difficulty=result.difficulty,
+            diagnostics=diagnostics,
+        )
+        await self._store.log_decision(entry)
+
+    # ------------------------------------------------------------------ #
     # Scoring pipeline: classifier -> capability-fit -> cost/tier re-ranking
     # ------------------------------------------------------------------ #
     async def _rank(
@@ -432,7 +483,7 @@ class RouteEngine:
         """Fold task difficulty + capability tier into per-candidate relevance.
 
         ``suitability = relevance * capability_fit`` where
-        ``capability_fit = 1 - max(0, difficulty - tier/maxTier)``.
+        ``capability_fit = 1 - max(0, difficulty**capability_curve - tier/maxTier)``.
 
         A model is penalised only when *under-powered* for the task (its normalised
         tier falls short of the difficulty); ample capability is never punished.
@@ -443,6 +494,18 @@ class RouteEngine:
         model on a non-coding task, relevance ~0) would inflate maxTier and deflate
         every in-domain model's fit, pushing the no-think -> think boundary far too
         low (a trivial title-generation task would then upgrade to a think model).
+
+        The ``difficulty**capability_curve`` exponent (curve > 1) guards a related
+        but distinct case: an IN-domain escalation target that is genuinely far
+        away in tier (e.g. a local no-think/think pair sharing a domain with a much
+        higher-tier cloud model). That candidate correctly stays in ``maxTier`` — it
+        IS in-domain — but a linear comparison would then make even a trivial task
+        look "under-powered" for the low-tier local model, since maxTier is set by
+        the distant cloud tier rather than the near (think) one. Raising difficulty
+        to a power > 1 leaves the difficulty=1.0 case unchanged (full escalation to
+        the top tier still triggers for the hardest tasks) while delaying the
+        penalty's onset at low/mid difficulty, so ``tier_bias`` below — not this
+        capability check — is what picks the lightest *sufficient* model.
 
         When the classifier gave no difficulty estimate (parse failure / heuristic
         fallback) relevance passes through unchanged.
@@ -460,19 +523,21 @@ class RouteEngine:
         ]
         max_tier = max(contenders, default=0) or 1
         difficulty = result.difficulty
+        required = difficulty ** self._s.capability_curve
         adjusted: list[CandidateScore] = []
         for s in result.scores:
             spec = specs.get(s.model)
             if spec is None:
                 adjusted.append(s)
                 continue
-            capability_fit = 1.0 - max(0.0, difficulty - spec.tier / max_tier)
+            capability_fit = 1.0 - max(0.0, required - spec.tier / max_tier)
             adjusted.append(
                 CandidateScore(model=s.model, score=s.score * capability_fit)
             )
-        # Preserve difficulty: the cost/tier re-ranking downstream scales its
-        # penalties by it (harder task -> tolerate cost/heavier model).
-        return ClassifierResult(scores=adjusted, difficulty=difficulty)
+        # Preserve difficulty and raw diagnostics: the cost/tier re-ranking
+        # downstream scales its penalties by difficulty (harder task -> tolerate
+        # cost/heavier model), and decision logging needs raw regardless of stage.
+        return ClassifierResult(scores=adjusted, difficulty=difficulty, raw=result.raw)
 
     # ------------------------------------------------------------------ #
     # Cost / tier aware re-ranking of pure suitability scores
@@ -518,7 +583,9 @@ class RouteEngine:
                 + self._s.tier_bias * (spec.tier / max_tier)
             ) * cost_relax
             adjusted.append(CandidateScore(model=s.model, score=s.score - penalty))
-        return ClassifierResult(scores=adjusted)
+        # Preserve difficulty/raw: decision logging (see ``_log_decision``) reads
+        # them off the result ``_rank`` returns.
+        return ClassifierResult(scores=adjusted, difficulty=result.difficulty, raw=result.raw)
 
     def _select_best(
         self, result: ClassifierResult, candidates: list[ModelSpec]

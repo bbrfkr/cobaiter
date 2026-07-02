@@ -31,15 +31,16 @@ class ModelSpec(BaseModel):
     # Capability tier as an integer: larger = more capable / slower / heavier.
     # Used by the router deterministically: it matches a candidate's tier against
     # the task difficulty (capability fit) and adds a mild capability bonus. NOT
-    # shown to the classifier, which judges use-case *relevance* only — the tier vs
-    # difficulty maths stays in code so the score is calibrated and reproducible.
+    # part of the relevance scoring, which judges use-case domain only — the tier
+    # vs difficulty maths stays in code so the score is calibrated and reproducible.
     tier: int = 1
     # Free-text description of the model's USE-CASE DOMAIN only (e.g. software
-    # development vs non-coding general use). Surfaced to the classifier, which
-    # scores TOPIC relevance from it — so it must NOT contain difficulty/capability,
-    # cost, speed, or input-length wording; difficulty is a separate per-task axis
-    # matched against ``tier`` in the router. Models sharing a domain should share
-    # the same description and be distinguished by ``tier``/``cost``.
+    # development vs non-coding general use). Embedded and compared against the
+    # conversation digest to score TOPIC relevance — so it must NOT contain
+    # difficulty/capability, cost, speed, or input-length wording; difficulty is a
+    # separate per-task axis matched against ``tier`` in the router. Models sharing
+    # a domain should share the SAME description (they then tie on relevance) and
+    # be distinguished by ``tier``/``cost``.
     description: str = ""
     # Ordered list of alternates to try when this model becomes unavailable.
     fallback_chain: list[str] = Field(default_factory=list)
@@ -140,12 +141,35 @@ class CandidateScore(BaseModel):
     score: float
 
 
+class ClassifierDiagnostics(BaseModel):
+    """Raw, pre-adjustment classifier signals — the inputs the tunable anchors
+    (``embedding_rel_band``, ``difficulty_easy_anchor``/``hard_anchor``) turn into
+    scores. Logged alongside the eventual routing decision so an offline job can
+    later re-derive better anchors from real traffic without re-embedding."""
+
+    task_text: str | None = None
+    # model -> raw cosine similarity to that model's registry description.
+    candidate_sims: dict[str, float] = Field(default_factory=dict)
+    # Max cosine similarity of the task text to the easy/hard difficulty exemplar
+    # sets (see classifier.py); ``None`` when the exemplar-based estimate wasn't
+    # used (e.g. the low-intent shortcut or token-count fallback fired instead).
+    sim_easy: float | None = None
+    sim_hard: float | None = None
+
+
 class ClassifierResult(BaseModel):
     scores: list[CandidateScore] = Field(default_factory=list)
     # Task difficulty estimate in 0..1 for the whole conversation (capability-fit
-    # input). ``None`` when the classifier gave no usable estimate (parse failure /
-    # heuristic fallback), in which case the router skips the capability-fit step.
+    # input). ``None`` when no usable estimate exists, in which case the router
+    # skips the capability-fit step and applies the cost/tier penalties in full.
     difficulty: float | None = None
+    # Pre-adjustment diagnostics (task text, raw per-candidate cosine similarity,
+    # difficulty exemplar similarities). Opaque to the router's scoring pipeline —
+    # carried through ``_apply_difficulty``/``_adjust_scores`` unchanged and only
+    # consumed by decision logging (see ``DecisionLogEntry``) for later offline
+    # recalibration of the anchors/band that turn these raw signals into scores.
+    # ``None`` when the embedding call failed (nothing informative to log).
+    raw: ClassifierDiagnostics | None = None
 
     def best(self) -> CandidateScore | None:
         return max(self.scores, key=lambda s: s.score) if self.scores else None
@@ -155,6 +179,29 @@ class ClassifierResult(BaseModel):
             if s.model == model:
                 return s.score
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Decision logging (offline recalibration input)
+# --------------------------------------------------------------------------- #
+class DecisionLogEntry(BaseModel):
+    """One classifier-driven routing decision, persisted for later offline
+    recalibration of the difficulty/relevance heuristics against real traffic.
+
+    Only emitted for routes where the classifier actually ran (``classifier-
+    select`` / ``context-switch``) — ``pinned``/``rule``/``failover``/``default``
+    carry no raw signal worth logging. ``task_text`` is omitted (redacted) for
+    conversations flagged privacy-sensitive (``needs_local``).
+    """
+
+    ts: float
+    conversation_key: str
+    turn: int
+    route: str
+    chosen_model: str
+    best_model: str | None = None
+    difficulty: float | None = None
+    diagnostics: ClassifierDiagnostics | None = None
 
 
 # Availability classification of a downstream error.

@@ -2,164 +2,334 @@
 
 The classifier is only invoked when the constraint filter leaves *more than one*
 candidate (initial routing) or when the stage-1 soft-gate fires (re-evaluation).
-It returns a 0..1 suitability score per candidate; the router applies the
-selection / hysteresis logic on top.
+It returns a 0..1 use-case relevance per candidate plus one task-difficulty
+scalar; the router applies the capability-fit / cost-tier / hysteresis logic on
+top.
+
+The previous implementation obtained both axes from a synchronous LLM call,
+which put ~1s of fixed latency on every routing decision — painful for agentic
+callers that fan one user instruction into many API calls. This version keeps
+the relevance/difficulty two-axis design but computes both without a generative
+LLM, from embeddings served through the LiteLLM gateway:
+
+* ``relevance``   — cosine similarity between the task text and each
+  candidate's use-case ``description``. Description vectors are cached
+  in-process.
+* ``difficulty``  — where the task text sits, by cosine similarity, between
+  two small fixed sets of "easy" and "hard" example tasks spanning MULTIPLE
+  domains (math, coding, science, law, ...), not just coding. A keyword list
+  (like the old ``_HIGH_INTENT`` regex this replaced) only ever covers the
+  domains someone thought to enumerate; embedding similarity generalises to
+  domains no one wrote a keyword for (e.g. "prove Gödel's incompleteness
+  theorem" scores as hard without any math-specific keyword list).
+
+Both axes are judged from the SAME text: the LATEST user message only (see
+``_task_text``) — not the system message (agent scaffolding), not assistant
+replies, and not earlier user turns. Conversation-level topic stability is
+already handled by sticky pinning (see router.py), not by blending prior
+turns into every embedding comparison; blending would let a long-running
+conversation's difficulty/relevance drift based on how many turns it has had,
+independent of what is actually being asked right now (measured: a two-turn
+"よろしく" + "こんにちは" scored measurably harder than "こんにちは" alone
+when earlier turns were folded in). Both axes reuse the SAME embedding, so the
+steady-state cost stays at ONE small embedding call per decision (description
+and exemplar vectors are cached after their first use).
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import math
+import re
 from typing import Any
 
 import httpx
 
 from .config import Settings
+from .features import count_code_blocks, estimate_tokens, message_text
 from .litellm_client import DownstreamError, LiteLLMClient
 from .schemas import (
     CandidateScore,
     ChatCompletionRequest,
+    ClassifierDiagnostics,
     ClassifierResult,
     ModelSpec,
 )
 
 log = logging.getLogger("cobaiter")
 
-# The classifier judges only *semantics* — it does NOT emit the final calibrated
-# score. It returns (a) one task-difficulty scalar and (b) a per-candidate use-case
-# relevance; the router turns those into a suitability via tier-vs-difficulty
-# capability-fit. Splitting the work this way keeps each LLM judgement simple (a
-# relative call it is good at) and moves the float arithmetic into reproducible
-# code, so scores spread across 0..1 instead of collapsing to {0, 1}. Cost and
-# tier are deliberately NOT shown — relevance must stay capability/price neutral.
-_SYSTEM = (
-    "You score candidate models for a user's task. Judge each candidate ONLY by its "
-    "described use-case DOMAIN; ignore cost, speed, capability, and any wording about "
-    "how advanced/hard/complex a model is (a hard task does NOT make an 'advanced'-"
-    "sounding model relevant).\n"
-    "Return ONLY ONE LINE of minified JSON with NO spaces and NO newlines, exactly: "
-    "{\"d\":<float>,\"r\":[<float>,...]}\n"
-    "- d = task difficulty 0.0-1.0 (0=trivial greeting/lookup/title, 0.5=moderate, "
-    "1.0=deep/expert reasoning). Judge the ACTION the user asks for, NOT the "
-    "difficulty of any quoted or embedded material: a meta-task over even expert "
-    "content — writing a short title, summarising, translating, reformatting, "
-    "extracting — is LOW difficulty (~0.1-0.2). Judge from what is asked, not "
-    "message length.\n"
-    "- r = one relevance 0.0-1.0 PER candidate, in the SAME ORDER as the numbered "
-    "list, for how well its domain matches the task topic (1.0=squarely covers it, "
-    "0.0=clearly a different domain, e.g. a coding model on a translation task). If a "
-    "description says the model is only for / unsuitable for a domain, score ~0.0 "
-    "outside that domain. Spread the values; do NOT make everything 0 or 1."
-)
 
+class EmbeddingClassifier:
+    """Relevance + difficulty from embedding similarity.
 
-class Classifier:
+    Same ``score(req, candidates) -> ClassifierResult`` contract as the old LLM
+    classifier, so the router is unchanged. On any embedding failure it falls
+    back to neutral relevance and a token-count-only difficulty estimate (the
+    router's deterministic cost/tier re-ranking then decides) — routing never
+    hard-fails on the classifier.
+    """
+
     def __init__(self, client: LiteLLMClient, settings: Settings) -> None:
         self._client = client
         self._s = settings
+        # description / exemplar text -> embedding vector. Both sets are small
+        # and stable per process (registry descriptions, fixed exemplar list),
+        # so a plain dict cache never needs eviction.
+        self._desc_vecs: dict[str, list[float]] = {}
+        self._exemplar_vecs: dict[str, list[float]] = {}
 
     async def score(
         self,
         req: ChatCompletionRequest,
         candidates: list[ModelSpec],
     ) -> ClassifierResult:
-        """Return suitability scores for ``candidates``.
-
-        On any downstream/parse failure, falls back to a uniform-suitability
-        heuristic so routing never hard-fails on the classifier; the router's
-        deterministic cost/tier re-ranking then picks the cheapest, lightest model.
-        """
         if not candidates:
             return ClassifierResult(scores=[])
-        names = [c.model for c in candidates]
-        try:
-            payload = self._build_payload(req, candidates)
-            data = await self._client.chat(payload)
-            text = _message_text(data)
-            # Diagnostic: the position->real-model mapping (the order the numbered
-            # catalog was sent in, i.e. how the classifier's ``r`` array maps back to
-            # models) plus the classifier's verbatim reply. Exposes degenerate
-            # winner-take-all output from a weak classifier model.
-            alias_map = {a: c.model for a, c in zip(_aliases(candidates), candidates)}
-            log.debug(
-                "classify(raw): classifier_model=%s alias_map=%s response=%r",
-                self._s.classifier_model, alias_map, text,
+        latest_user_msg = _latest_user_message(req.messages)
+        latest_user = message_text(latest_user_msg) if latest_user_msg else ""
+        latest_user = _strip_edge_punct(latest_user)
+        task_text = _task_text(latest_user, self._s.classifier_digest_chars)
+
+        task_vec, rels, raw_sims = await self._embed_and_score_relevance(
+            task_text, candidates
+        )
+        if rels is None:
+            # No embedding signal: every candidate is equally relevant. The
+            # router's cost/tier re-ranking then picks the cheapest, lightest
+            # model.
+            rels = [_NEUTRAL_SUITABILITY] * len(candidates)
+
+        difficulty, sim_easy, sim_hard = self._difficulty(
+            latest_user, task_vec, latest_user_msg
+        )
+
+        scores = [
+            CandidateScore(model=c.model, score=r)
+            for c, r in zip(candidates, rels)
+        ]
+        # No diagnostics worth logging when the embedding call itself never
+        # produced a task vector (empty digest / gateway failure) — there is no
+        # raw signal for cobaiter.calibrate to regress against, only the neutral/
+        # fallback values already reflected in ``scores``/``difficulty``.
+        diagnostics = None
+        if task_vec is not None:
+            diagnostics = ClassifierDiagnostics(
+                task_text=task_text or None,
+                candidate_sims={
+                    c.model: s for c, s in zip(candidates, raw_sims or []) if s is not None
+                },
+                sim_easy=sim_easy,
+                sim_hard=sim_hard,
             )
-            result = self._parse(text, candidates)
-            log.debug(
-                "classify: classifier_model=%s candidates=%s scores=%s",
-                self._s.classifier_model, names, _fmt_scores(result),
-            )
-            return result
-        except (DownstreamError, httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
-            result = self._heuristic(candidates)
-            log.warning(
-                "classify: classifier_model=%s failed (%s); using heuristic scores=%s",
-                self._s.classifier_model, exc, _fmt_scores(result),
-            )
-            return result
+        result = ClassifierResult(scores=scores, difficulty=difficulty, raw=diagnostics)
+        log.debug(
+            "classify: embedding_model=%s difficulty=%.2f relevance=%s",
+            self._s.embedding_model, difficulty, _fmt_scores(result),
+        )
+        return result
 
     # ------------------------------------------------------------------ #
-    def _build_payload(
-        self, req: ChatCompletionRequest, candidates: list[ModelSpec]
-    ) -> dict[str, Any]:
-        # Anonymise model names: the classifier is itself an LLM and would otherwise
-        # let brand priors (e.g. a famous model name) override the neutral
-        # description. Show only a numbered list of descriptions — no model ids — and
-        # take back relevance as an array aligned to that order. This both forces a
-        # description-only verdict and keeps the prompt (input tokens) small.
-        catalog = "\n".join(
-            f"{i + 1}. {c.description}" for i, c in enumerate(candidates)
-        )
-        digest = _digest_conversation(req.messages, self._s.classifier_digest_chars)
-        user_msg = (
-            "Candidate models (numbered):\n"
-            + catalog
-            + "\n\nConversation (most recent last):\n"
-            + digest
-        )
-        return {
-            "model": self._s.classifier_model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            "temperature": 0,
-            "max_tokens": self._s.classifier_max_tokens,
-            "stream": False,
-        }
+    async def _embed_and_score_relevance(
+        self, task_text: str, candidates: list[ModelSpec]
+    ) -> tuple[list[float] | None, list[float] | None, list[float | None] | None]:
+        """Embed the task text (+ any not-yet-cached descriptions/exemplars) in
+        ONE batched call. Returns ``(task_vec, relevance, raw_sims)``; each may be
+        ``None`` on failure or empty input — the caller degrades each
+        independently (difficulty still works without descriptions, relevance
+        just falls back to neutral). ``raw_sims`` is the pre-``_spread`` cosine
+        similarity per candidate (diagnostics only, logged for offline
+        recalibration of ``embedding_rel_band``)."""
+        if not task_text.strip():
+            return None, None, None
+        descs = [c.description.strip() for c in candidates]
+        missing_desc = [d for d in dict.fromkeys(descs) if d and d not in self._desc_vecs]
+        missing_exemplars = [
+            e for e in _DIFFICULTY_EXEMPLARS if e not in self._exemplar_vecs
+        ]
+        batch = [task_text] + missing_desc + missing_exemplars
+        try:
+            vecs = await self._client.embed(self._s.embedding_model, batch)
+            if len(vecs) != len(batch):
+                raise ValueError(f"expected {len(batch)} embeddings, got {len(vecs)}")
+        except (
+            DownstreamError, httpx.HTTPError,
+            KeyError, IndexError, ValueError, TypeError,
+        ) as exc:
+            log.warning(
+                "classify: embedding_model=%s failed (%s); using neutral relevance "
+                "and fallback difficulty",
+                self._s.embedding_model, exc,
+            )
+            return None, None, None
+        task_vec = vecs[0]
+        self._desc_vecs.update(zip(missing_desc, vecs[1 : 1 + len(missing_desc)]))
+        self._exemplar_vecs.update(zip(missing_exemplars, vecs[1 + len(missing_desc) :]))
 
-    def _parse(self, text: str, candidates: list[ModelSpec]) -> ClassifierResult:
-        obj = json.loads(_extract_json(text))
-        # ``r`` is a per-candidate relevance array, positionally aligned to the
-        # numbered catalog sent in _build_payload.
-        rels = obj.get("r")
-        if not isinstance(rels, list) or not rels:
-            raise ValueError("classifier produced no usable scores")
-        scores: list[CandidateScore] = []
-        for i, c in enumerate(candidates):
-            raw = rels[i] if i < len(rels) else None
-            try:
-                # A missing/garbled entry falls back to neutral, never hard-fails.
-                score = _clamp(float(raw))
-            except (TypeError, ValueError):
-                score = _NEUTRAL_SUITABILITY
-            scores.append(CandidateScore(model=c.model, score=score))
-        diff_raw = obj.get("d")
-        difficulty = _clamp(float(diff_raw)) if diff_raw is not None else None
-        return ClassifierResult(scores=scores, difficulty=difficulty)
-
-    def _heuristic(self, candidates: list[ModelSpec]) -> ClassifierResult:
-        # No signal available: treat every candidate as equally relevant and give no
-        # difficulty estimate, so the router skips capability-fit and lets its
-        # deterministic cost/tier re-ranking decide.
-        return ClassifierResult(
-            scores=[
-                CandidateScore(model=c.model, score=_NEUTRAL_SUITABILITY)
-                for c in candidates
-            ],
-            difficulty=None,
+        if not any(descs):
+            return task_vec, None, None
+        sims = [_cosine(task_vec, self._desc_vecs[d]) if d else None for d in descs]
+        log.debug(
+            "classify(raw): embedding_model=%s sims=%s",
+            self._s.embedding_model,
+            ", ".join(
+                f"{c.model}={s:.3f}" if s is not None else f"{c.model}=n/a"
+                for c, s in zip(candidates, sims)
+            ),
         )
+        return task_vec, _spread(sims, self._s.embedding_rel_band), sims
+
+    # ------------------------------------------------------------------ #
+    def _difficulty(
+        self,
+        latest_user: str,
+        task_vec: list[float] | None,
+        latest_user_msg: dict[str, Any] | None,
+    ) -> tuple[float, float | None, float | None]:
+        """0..1 task difficulty, plus the raw (sim_easy, sim_hard) exemplar
+        similarities behind it (``None`` when the exemplar-based estimate wasn't
+        used — diagnostics only, for offline recalibration of the anchors). See
+        module docstring for the embedding-vs-exemplars approach; falls back to a
+        token-count-only estimate when no embedding is available (empty task text
+        / embedding call failed)."""
+        intent = _intent_slice(latest_user)
+        # 0.15 keeps a tier-1 model un-penalised in the capability fit even when
+        # a tier-6 candidate sets maxTier (1/6 ≈ 0.167 is the no-penalty
+        # threshold), so meta-tasks stay on the lightest (no-think) model.
+        # Checked before the embedding signal: it is a reliable, deterministic
+        # override (a title-generation wrapper is trivial no matter how hard
+        # the embedded material looks) that similarity-to-exemplars alone isn't
+        # guaranteed to catch, since head+tail truncation of a long message can
+        # still carry hard-looking embedded content alongside the trivial
+        # instruction.
+        if _LOW_INTENT.search(intent):
+            return 0.15, None, None
+
+        easy_vecs = [self._exemplar_vecs[e] for e in _EASY_EXEMPLARS if e in self._exemplar_vecs]
+        hard_vecs = [self._exemplar_vecs[e] for e in _HARD_EXEMPLARS if e in self._exemplar_vecs]
+        if task_vec is None or not easy_vecs or not hard_vecs:
+            return _fallback_difficulty(latest_user_msg), None, None
+
+        sim_easy = max(_cosine(task_vec, v) for v in easy_vecs)
+        sim_hard = max(_cosine(task_vec, v) for v in hard_vecs)
+        ratio = sim_hard / (sim_hard + sim_easy) if (sim_hard + sim_easy) > 0 else 0.5
+        difficulty = difficulty_from_ratio(
+            ratio, self._s.difficulty_easy_anchor, self._s.difficulty_hard_anchor
+        )
+        if _ERROR_MARKERS.search(latest_user):
+            difficulty += 0.05
+        scoped = [latest_user_msg] if latest_user_msg else []
+        if count_code_blocks(scoped) > 0:
+            difficulty += 0.03
+        return _clamp(difficulty, 0.1, 0.9), sim_easy, sim_hard
+
+
+# --------------------------------------------------------------------------- #
+# Difficulty: embedding-anchored, domain-diverse exemplars
+# --------------------------------------------------------------------------- #
+# Small, hand-picked exemplar sets spanning MULTIPLE domains, so difficulty
+# generalises the way relevance does — via meaning, not a per-domain keyword
+# list that has to be extended every time a new domain (law, economics,
+# science, ...) shows up. Kept short: each is embedded once and cached, so the
+# set size only affects a one-time warm-up cost, not steady-state latency.
+_EASY_EXEMPLARS = [
+    "こんにちは",
+    "ありがとうございます",
+    "今日の天気は？",
+    "元気ですか？",
+    "了解しました",
+    "1たす1は？",
+    "フランスの首都はどこですか？",
+    "この単語の意味を教えて",
+    "おすすめのレシピを教えて",
+    "今何時ですか？",
+]
+_HARD_EXEMPLARS = [
+    "ゲーデルの不完全性定理を証明してください",
+    "このシステムのメモリリークの原因を調査してデバッグしてください",
+    "量子もつれが超光速通信に使えない理由を物理学的に説明してください",
+    "この契約書に潜む法的リスクを分析してください",
+    "マクロ経済政策が為替レートに与える影響を多角的に論じてください",
+    "この分散システムのアーキテクチャ設計をレビューし、ボトルネックを特定してください",
+]
+_DIFFICULTY_EXEMPLARS = _EASY_EXEMPLARS + _HARD_EXEMPLARS
+
+# Intent keywords matched against the LATEST USER MESSAGE only (both ends —
+# wrappers state the action up-front, Japanese prompts often put it at the
+# end). The system message is deliberately NOT scanned: for agentic clients
+# (opencode, Claude Code, ...) it is generic agent/tool scaffolding, not a
+# per-task instruction, and routinely describes the AGENT's own capabilities
+# ("helps debug, implement, and review code") — matching those words would
+# misjudge every single request from that client as high-difficulty regardless
+# of what was actually asked.
+_LOW_INTENT = re.compile(
+    r"タイトル|題名|要約|翻訳|訳して|整形|抽出|挨拶|"
+    r"title|summar|translat|extract|reformat|greeting",
+    re.IGNORECASE,
+)
+_ERROR_MARKERS = re.compile(
+    r"traceback|exception|stack ?trace|スタックトレース|エラー|error[: ]|"
+    r"diff --git|panic:",
+    re.IGNORECASE,
+)
+
+# Portion of the latest user message scanned for intent keywords (chars).
+_INTENT_USER_SLICE = 300
+
+# Trailing/leading whitespace and sentence-terminal punctuation, stripped before
+# embedding. Measured: the embedding model is brittle to this — "こんにちは"
+# (an _EASY_EXEMPLARS entry verbatim) embeds near-identically to itself
+# (difficulty ~0.26), but "こんにちは。" with just a trailing 句点 no longer
+# matches and scores difficulty ~0.34, a swing large enough to matter downstream.
+# Only the edges are stripped (not mid-text) so code/error text is untouched.
+_EDGE_PUNCT = re.compile(r"^[\s。、！？!?]+|[\s。、！？!?]+$")
+
+
+def _strip_edge_punct(text: str) -> str:
+    return _EDGE_PUNCT.sub("", text)
+
+
+def _intent_slice(latest_user: str) -> str:
+    return latest_user[:_INTENT_USER_SLICE] + "\n" + latest_user[-_INTENT_USER_SLICE:]
+
+
+def _latest_user_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((m for m in reversed(messages) if m.get("role") == "user"), None)
+
+
+def _rescale(x: float, lo: float, hi: float, out_lo: float, out_hi: float) -> float:
+    """Linearly map ``x`` from ``[lo, hi]`` to ``[out_lo, out_hi]`` (unclamped;
+    the caller clamps the final difficulty after adding bumps)."""
+    span = hi - lo
+    if span <= 0:
+        return (out_lo + out_hi) / 2
+    return out_lo + (x - lo) / span * (out_hi - out_lo)
+
+
+def difficulty_from_ratio(ratio: float, easy_anchor: float, hard_anchor: float) -> float:
+    """Map the raw ``sim_hard / (sim_hard + sim_easy)`` exemplar-similarity ratio
+    to the 0.15..0.85 difficulty range, given the two calibration anchors.
+
+    Public (unlike the rest of this module's helpers) and deliberately free of
+    the ``+0.05``/``+0.03`` bumps and final clamp applied in ``_difficulty`` —
+    ``cobaiter.calibrate`` needs this exact, invertible core formula to fit new
+    anchors from judge-labelled traffic without duplicating it.
+    """
+    return _rescale(ratio, easy_anchor, hard_anchor, 0.15, 0.85)
+
+
+def _fallback_difficulty(latest_user_msg: dict[str, Any] | None) -> float:
+    """Token-count-only estimate used only when no embedding signal is
+    available at all (empty digest / embedding call failed). Coarser than the
+    exemplar-similarity signal but needs no network."""
+    scoped = [latest_user_msg] if latest_user_msg else []
+    tokens = estimate_tokens(scoped)
+    if tokens < 400:
+        return 0.25
+    if tokens < 2000:
+        return 0.4
+    if tokens < 8000:
+        return 0.55
+    return 0.65
 
 
 # --------------------------------------------------------------------------- #
@@ -168,64 +338,59 @@ class Classifier:
 _NEUTRAL_SUITABILITY = 0.5
 
 
-def _aliases(candidates: list[ModelSpec]) -> list[str]:
-    """Opaque per-position labels shown to the classifier in place of real model
-    names, so it cannot let brand priors override the description/tier verdict.
-    Position-based, so build- and parse-time mappings agree given the same list."""
-    return [f"candidate-{i + 1}" for i in range(len(candidates))]
-
-
 def _fmt_scores(result: ClassifierResult) -> str:
     return ", ".join(f"{s.model}={s.score:.3f}" for s in result.scores)
 
 
-def _message_text(data: dict[str, Any]) -> str:
-    """Extract the assistant text from a completion response.
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / math.sqrt(na * nb)
 
-    Prefers ``content``; for "thinking" models that may leave ``content`` empty,
-    falls back to ``reasoning_content`` so an embedded JSON verdict can still be
-    recovered.
+
+def _spread(sims: list[float | None], band: float) -> list[float]:
+    """Map cosine similarities to 0..1 relevance.
+
+    Raw cosine values sit in a model-dependent compressed band (unrelated texts
+    rarely score near 0), so absolute similarity is meaningless to the router.
+    Anchor on the best candidate instead: the top similarity maps to relevance
+    1.0 and a full ``band`` of similarity deficit costs the whole relevance
+    range. Same-domain candidates share one description (identical similarity)
+    and stay tied at 1.0, leaving tier/cost to decide; a different-domain
+    description falls off fast. Candidates without a description score neutral.
     """
-    msg = data["choices"][0]["message"]
-    content = msg.get("content")
-    if content:
-        return content
-    return msg.get("reasoning_content") or ""
+    band = max(band, 1e-6)
+    top = max(s for s in sims if s is not None)
+    return [
+        _NEUTRAL_SUITABILITY if s is None else _clamp(1.0 - (top - s) / band)
+        for s in sims
+    ]
 
 
-def _clamp(v: float) -> float:
-    return max(0.0, min(1.0, v))
+def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
 
 
-def _digest_conversation(messages: list[dict[str, Any]], limit: int = 800) -> str:
-    parts: list[str] = []
-    for m in messages:
-        role = m.get("role", "?")
-        content = m.get("content")
-        if isinstance(content, list):
-            content = " ".join(
-                p.get("text", "[non-text]")
-                for p in content
-                if isinstance(p, dict)
-            )
-        parts.append(f"{role}: {content}")
-    text = "\n".join(parts)
-    if len(text) <= limit:
-        return text
-    # Over budget: keep BOTH ends rather than only the tail. The HEAD carries the
-    # task instruction that often sits up-front (e.g. a "generate a title for the
-    # following chat" wrapper whose body is the embedded conversation); keeping only
-    # the tail would show the classifier the embedded content and hide the actual,
-    # trivial action — inflating the difficulty estimate. The tail keeps the most
-    # recent context. Total stays within ``limit`` bar the short elision marker.
+def _task_text(latest_user: str, limit: int = 800) -> str:
+    """Truncate the LATEST user message to ``limit`` chars for embedding.
+
+    Scoped to that single message — not the system message (agent
+    scaffolding), not assistant replies, and not earlier user turns — so both
+    relevance and difficulty judge what's being asked NOW (see module
+    docstring). Keeps BOTH ends when over budget rather than only the tail:
+    the HEAD carries the task instruction that often sits up-front (e.g. a
+    "generate a title for the following chat" wrapper whose body is the
+    embedded conversation); keeping only the tail would show the embedded
+    content and hide the actual, trivial action. The tail keeps the most
+    recent context. Total stays within ``limit`` bar the short elision marker.
+    """
+    if len(latest_user) <= limit:
+        return latest_user
     head = limit // 3
     tail = limit - head
-    return text[:head] + "\n…\n" + text[-tail:]
-
-
-def _extract_json(text: str) -> str:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("no JSON object in classifier output")
-    return text[start : end + 1]
+    return latest_user[:head] + "\n…\n" + latest_user[-tail:]

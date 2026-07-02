@@ -12,7 +12,8 @@
 - **モデル非依存の自動選択**: エージェントは `cobaiter-auto` を呼ぶだけ。
 - **会話スティッキー**: 会話ごとにモデルを固定（`route: pinned`）。一貫性を担保。
 - **ハイブリッド判定**: ハード制約フィルタ（モデルレジストリ）で候補を絞り、複数残るときだけ
-  軽量分類モデルで 1 つを選択。決定的なら分類器を呼ばない。
+  **embedding 類似度（relevance）＋ヒューリスティック（difficulty）**で 1 つを選択。
+  生成系 LLM を同期パスで呼ばないため、ルーティングの固定レイテンシーは数十 ms 程度。
 - **ヒステリシス付き再ルーティング**: 文脈が実質的に変化したら会話途中でも切替（`route: context-switch`）。
   `min_dwell_turns` と `switch_margin` で過剰なフラッピングを抑制。
 - **フェイルオーバー**: コンテキスト長超過 / レート制限 / クォータ枯渇 / 障害を検出し、
@@ -25,7 +26,7 @@
 AIエージェント ──(cobaiter-auto, OpenAI互換)──▶ cobaiter ──(具体モデル名)──▶ LiteLLM ──▶ Claude / GLM / Ollama ...
                                                   │                               ▲
                 ┌─────────────────────────────────┼──────────────┐               │ budget/spend 参照
-   会話状態(Valkey)            モデルレジストリ(Valkey)        軽量分類モデル        │ (クレジット余力)
+   会話状態(Valkey)            モデルレジストリ(Valkey)        embeddingモデル      │ (クレジット余力)
    conv:<key>→{model,...}     capabilities/窓/cost/tier/     (LiteLLM経由)─────────┘
                               fallback_chain                 ※複数候補時だけ
 ```
@@ -41,7 +42,8 @@ AIエージェント ──(cobaiter-auto, OpenAI互換)──▶ cobaiter ─�
 3. ハード制約を再計算（画像/ツール/プライバシー/トークン数 vs 窓）＋各モデルの可用性・クレジット余力。
 4. **継続会話（新しいユーザーターン）**: 固定モデルが有効なら `pinned`。制約違反/不可用/クレジット枯渇なら即 `failover`。
    実質的な文脈変化があれば（2 段ゲート: 安価トリガ→再分類→マージン判定）`context-switch`。
-5. **新規会話**: 制約フィルタ後、候補 1 つなら `rule`、複数なら分類モデルで `classifier-select`、0 なら `default`。
+5. **新規会話**: 制約フィルタ後、候補 1 つなら `rule`、複数なら relevance/difficulty スコアリングで
+   `classifier-select`、0 なら `default`。
 
 > **ターンの定義**: ヒステリシス（`min_dwell_turns` / `soft_recheck_every`）が数える「ターン」は
 > **ユーザーの発話 1 回**であり、ダウンストリームの API コール回数ではありません。エージェンティック
@@ -91,13 +93,20 @@ models:
   # ... 以降、運用するモデルを列挙
 ```
 
-**関心の分離**がこのスキーマの肝です。`description` は各モデルの**用途のみ**を表す自由文で、分類器はこれだけを見て
-2つだけを判定します（コスト・速度・能力の文言は一切見せない）:
+**関心の分離**がこのスキーマの肝です。`description` は各モデルの**用途のみ**を表す自由文で、
+ルーティング時に 2 軸のスコアを**LLM 生成なし**で算出します:
 
-- **`relevance`（0..1）** … 各候補の用途がタスクの**トピック**にどれだけ合うか（能力の高低ではない）
-- **`difficulty`（0..1）** … タスク全体の**難易度**（1つのスカラ）
+- **`relevance`（0..1）** … 会話ダイジェストの embedding と各候補 `description` の embedding の
+  **cosine 類似度**。最良候補を 1.0 に固定し、類似度が `COBAITER_EMBEDDING_REL_BAND`（既定 0.10）
+  下回るごとに 0.0 へ落とすコントラスト正規化を行う（生 cosine は圧縮帯域に張り付くため）。
+  description ベクトルはプロセス内キャッシュされ、定常状態では**リクエストあたり embedding 1 コール
+  （ダイジェストのみ）**で済む。
+- **`difficulty`（0..1）** … 決定的なヒューリスティック。入力トークン数を基底に、指示部
+  （system 冒頭＋最新 user メッセージの先頭/末尾）の意図キーワード（設計/原因調査/実装/レビュー
+  などで加点）、エラー・スタックトレース痕跡、code fence で加点。タイトル生成・要約・翻訳・抽出
+  などの**メタタスク語が指示部にあれば、埋め込まれた本文がどれだけ難しくても低難度（0.15）に固定**。
 
-連続値の算術は LLM ではなく**ルーターのコード**が決定的に合成します。まず能力適合を作り、続いて cost/tier を再ランキング:
+続く連続値の算術は**ルーターのコード**が決定的に合成します。まず能力適合を作り、続いて cost/tier を再ランキング:
 
 ```
 capability_fit = 1 − max(0, difficulty − tier/maxTier)   # 力不足のときだけ減点、過剰能力は満点
@@ -113,8 +122,9 @@ cost/tier ペナルティは `(1 − difficulty)` でスケールします。**�
 高能力な有料モデルが勝てる）ようにします。つまり difficulty が「コストと能力のトレードオフ」を一括で握るノブです。
 **各モデル自身の suitability ではなく difficulty でスケールする**のが要点で、`(1 − suitability)` でスケールすると分類器が
 「ドメイン的にドンピシャ（suitability=1.0）」と判定した瞬間にコストペナルティが 0 になり、同じく十分な無料ローカル
-モデルがあっても有料クラウドが必ず勝ってしまう（コスト選好が無効化される）ためです。difficulty が無い場合（分類器の
-パース失敗・ヒューリスティックフォールバック）はペナルティを満額適用し、最安・最軽量へ素直に倒します。
+モデルがあっても有料クラウドが必ず勝ってしまう（コスト選好が無効化される）ためです。difficulty が無い場合は
+ペナルティを満額適用し、最安・最軽量へ素直に倒します（embedding が失敗しても relevance が全候補一律 0.5 に
+なるだけで、difficulty ヒューリスティックは常に算出されます）。
 
 `capability_fit` の `maxTier` は**実際に競合している候補**（relevance がトップの `COBAITER_CAPABILITY_REL_FRACTION`
 ＝既定 0.5 以上）だけで取ります。relevance ~0 の畑違いモデル（例: 非コーディングタスクにおける高 tier の coding
@@ -129,8 +139,38 @@ cost/tier ペナルティは `(1 − difficulty)` でスケールします。**�
 
 実行中の一時的な上書きは `PUT /admin/models` でも可能ですが、再起動すると設定ファイルに再同期されます。
 能力値（窓・マルチモーダル・ツール対応）はバックエンドに合わせて手動調整してください
-（LiteLLM 側に未設定なことが多いため）。分類用モデル（`COBAITER_CLASSIFIER_MODEL`）はルーティング対象外なので
-レジストリには含めません。
+（LiteLLM 側に未設定なことが多いため）。embedding モデル（`COBAITER_EMBEDDING_MODEL`）はルーティング対象外
+なのでレジストリには含めません（LiteLLM 側の `model_list` には `/v1/embeddings` 対応エントリとして登録が必要）。
+
+### difficulty/relevance の再キャリブレーション（ログ + LLM judge）
+
+`difficulty_easy_anchor` / `difficulty_hard_anchor` / `embedding_rel_band` は、当初は手作業の少数
+キャリブレーションセットで一度だけ決めた定数です。実運用のトラフィックで妥当性を検証・再調整できるよう、
+分類器が実際に判断した回（`route: classifier-select` / `context-switch`）の生シグナルを Valkey の
+Stream（`cobaiter:decisions`）に記録し、オフラインの `cobaiter-calibrate` コマンドで再キャリブレーションを
+支援します。
+
+- **何を記録するか**: 会話キー・ターン・route・選定モデル・difficulty、および各候補への raw cosine
+  類似度と difficulty exemplar への類似度（`sim_easy`/`sim_hard`）。プライバシー会話（`needs_local`）では
+  タスク本文（`task_text`）を必ず `None` に落とし、cosine 等の非テキストシグナルのみ残します。
+  `COBAITER_DECISION_LOG_ENABLED=false` で無効化、`COBAITER_DECISION_LOG_MAXLEN` で Stream の上限
+  （近似トリム）を指定できます。記録は best-effort — Valkey 書き込みに失敗してもルーティング自体は失敗しません。
+- **再キャリブレーション**: `COBAITER_CALIBRATION_JUDGE_MODEL` に judge 用モデルを設定した上で
+
+  ```bash
+  uv run cobaiter-calibrate
+  # あるいは: uv run python -m cobaiter.calibrate
+  ```
+
+  を実行すると、ログから最大 `COBAITER_CALIBRATION_SAMPLE_SIZE` 件をサンプリングし、各タスク本文を
+  judge モデルに投げて 0..1 の難易度ラベルを取得、既存の `sim_easy`/`sim_hard` 比率に対して最小二乗で
+  線形回帰し、`difficulty_easy_anchor`/`hard_anchor` の推奨値と RMSE（現行 vs 推奨）をレポートします。
+  あわせて、候補間の raw cosine 類似度差が `COBAITER_EMBEDDING_REL_BAND` 未満だった「際どい」ルーティング
+  判断も一覧表示するので、relevance 側（description の書き方や band）の見直し材料になります。
+- **意図的に自動適用しない**: judge 呼び出しは同期 LLM 生成そのもの（分類器が embedding 方式に置き換えた
+  レイテンシコスト）なので、このツールはリクエストのホットパスには一切乗らず、常にオフラインでバッチ実行
+  します。またルーター自身の誤判定がそのまま「正解」として再学習に混入するフィードバックループを避けるため、
+  `.env` の値は**人間がレポートを見て手動で書き換える**運用とし、自動書き込みは行いません。
 
 ### チャット（OpenAI 互換）
 
@@ -186,8 +226,9 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `COBAITER_VIRTUAL_MODEL` | `cobaiter-auto` | エージェントが呼ぶ仮想モデル名。これ宛のリクエストをルーティング対象とする |
-| `COBAITER_CLASSIFIER_MODEL` | `claude-haiku-4-5` | 候補が複数残るときだけ使う軽量分類モデル。**レジストリには含めない**（ルーティング対象外） |
-| `COBAITER_CLASSIFIER_MAX_TOKENS` | `2048` | 分類呼び出しの最大出力トークン。"thinking" 型分類モデルが思考＋JSON を出し切れるよう確保（小さすぎると JSON が切れてヒューリスティックへ退避） |
+| `COBAITER_EMBEDDING_MODEL` | `text-embedding-3-small` | relevance スコアリングに使う embedding モデル（LiteLLM の `/v1/embeddings` 経由）。**レジストリには含めない**（ルーティング対象外） |
+| `COBAITER_EMBEDDING_REL_BAND` | `0.10` | relevance のコントラスト帯域。最良候補との cosine 類似度差がこの値に達すると relevance 0.0。小さいほどドメイン分離が鋭くなる |
+| `COBAITER_CLASSIFIER_DIGEST_CHARS` | `400` | embedding するタスクダイジェスト（会話の先頭＋末尾）の最大文字数 |
 | `COBAITER_DEFAULT_MODEL` | `claude-haiku-4-5` | どの候補も制約を満たさないときの安全なフォールバック先 |
 
 ### 会話スティッキー / ヒステリシス
@@ -201,6 +242,15 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | `COBAITER_SWITCH_MARGIN` | `0.15` | 切替に必要な「最良候補スコア − 固定モデルスコア」の優位差。小さいほど切り替わりやすい |
 | `COBAITER_SOFT_RECHECK_EVERY` | `4` | 変化トリガが無くても N ユーザーターン毎に分類器で定期再評価する周期 |
 | `COBAITER_SCORE_EMA_ALPHA` | `0.5` | 固定モデルスコアの EMA 平滑係数（0..1、大きいほど直近に反応） |
+
+### ログ / 再キャリブレーション
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_DECISION_LOG_ENABLED` | `true` | 分類器が実行された判断を `cobaiter:decisions`（Valkey Stream）へ記録するか |
+| `COBAITER_DECISION_LOG_MAXLEN` | `20000` | 上記 Stream の上限（`XADD MAXLEN ~`、近似トリム） |
+| `COBAITER_CALIBRATION_JUDGE_MODEL` | （空） | `cobaiter-calibrate` が difficulty のゴールドラベル生成に使う judge モデル。未設定だと実行時エラー |
+| `COBAITER_CALIBRATION_SAMPLE_SIZE` | `200` | 1 回の再キャリブレーションでログから抽出しジャッジに投げる件数の上限 |
 
 ### クレジット / 可用性（LiteLLM の budget/spend を参照）
 
@@ -233,8 +283,7 @@ uv run pytest
   フェイルオーバーのみ（可用性・制約違反は留まれないため切替）。
 - 依存障害は 500 にせず明示化: **LiteLLM 到達不能 → 502**、**Valkey（状態ストア）到達不能 → 503**。
   `/healthz` は Valkey 障害時 `degraded` を返す。
-- 分類モデルが "thinking" 型でも動作するよう、`COBAITER_CLASSIFIER_MAX_TOKENS`（既定 2048）で思考＋JSON の
-  出力長を確保し、`content` が空なら `reasoning_content` からも JSON を回収する。分類が失敗した場合は
-  全候補を一律 suitability とみなして安全にフォールバックし（あとはルーターの cost/tier 再ランクが最安・最軽量を
-  選ぶ）、ログに分類モデル名・スコア・採否を出力する。
+- relevance/difficulty の算出に生成系 LLM は使わない（embedding 1 コール＋決定的ヒューリスティックのみ）。
+  embedding 呼び出しが失敗した場合は全候補を一律 relevance 0.5 とみなして安全にフォールバックし
+  （あとはルーターの cost/tier 再ランクが最安・最軽量を選ぶ）、ログに embedding モデル名・スコア・採否を出力する。
 - API キー等の機密は `.env` で管理し、ログ・レスポンスに出さない。

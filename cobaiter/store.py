@@ -1,4 +1,4 @@
-"""Valkey-backed persistence: conversation state + model registry.
+"""Valkey-backed persistence: conversation state + model registry + decision log.
 
 Valkey is wire-compatible with Redis, so the ``redis.asyncio`` client is used.
 All values are stored as JSON strings.
@@ -7,16 +7,22 @@ Keys
 ----
 ``cobaiter:conv:<key>``   string(JSON ConversationState), per-conversation, TTL'd
 ``cobaiter:models``       hash model -> JSON ModelSpec
+``cobaiter:decisions``    stream, one entry(JSON DecisionLogEntry) per field "data"
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 import redis.asyncio as redis
 
 from .config import Settings
-from .schemas import ConversationState, ModelSpec
+from .schemas import ConversationState, DecisionLogEntry, ModelSpec
+
+log = logging.getLogger("cobaiter")
+
+DECISIONS_KEY = "cobaiter:decisions"
 
 CONV_PREFIX = "cobaiter:conv:"
 MODELS_KEY = "cobaiter:models"
@@ -77,6 +83,35 @@ class Store:
 
     async def delete_model(self, model: str) -> bool:
         return bool(await self._r.hdel(MODELS_KEY, model))
+
+    # ------------------------------------------------------------------ #
+    # Decision log (offline recalibration input)
+    # ------------------------------------------------------------------ #
+    async def log_decision(self, entry: DecisionLogEntry) -> None:
+        """Append one decision to the ``cobaiter:decisions`` stream.
+
+        Best-effort: any Valkey failure is logged and swallowed here so a decision
+        logging hiccup never fails or delays the routing decision itself (this is
+        called synchronously from the request path, same as other Store calls).
+        The stream is trimmed to ``decision_log_maxlen`` (approximate trim, cheap)
+        so it never grows unbounded.
+        """
+        try:
+            await self._r.xadd(
+                DECISIONS_KEY,
+                {"data": entry.model_dump_json()},
+                maxlen=self._settings.decision_log_maxlen,
+                approximate=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - logging must never break routing
+            log.warning("decision log write failed: %s", exc)
+
+    async def read_decisions(self, count: int = 1000) -> list[DecisionLogEntry]:
+        """Return up to ``count`` most recent logged decisions, oldest first."""
+        raw = await self._r.xrevrange(DECISIONS_KEY, count=count)
+        entries = [DecisionLogEntry.model_validate_json(fields["data"]) for _, fields in raw]
+        entries.reverse()
+        return entries
 
     # ------------------------------------------------------------------ #
     # Seeding

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 cobaiter = "cobaiter.__main__:main"
+cobaiter-calibrate = "cobaiter.calibrate:main"
 
 [dependency-groups]
 dev = [

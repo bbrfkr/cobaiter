@@ -107,6 +107,23 @@ class LiteLLMClient:
         except httpx.HTTPError as exc:
             raise self._transport_error(exc) from exc
 
+    # ------------------------------------------------------------------ #
+    # Embeddings (used by the routing classifier for relevance scoring)
+    # ------------------------------------------------------------------ #
+    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        """Return one embedding vector per input text, in input order."""
+        payload = {"model": model, "input": texts}
+        try:
+            resp = await self._c.post("/v1/embeddings", json=payload)
+        except httpx.HTTPError as exc:
+            raise self._transport_error(exc) from exc
+        if resp.status_code >= 400:
+            self._raise(resp.status_code, resp.text)
+        data = resp.json()["data"]
+        # Items may arrive out of order; ``index`` maps each back to its input.
+        ordered = sorted(data, key=lambda item: item.get("index", 0))
+        return [item["embedding"] for item in ordered]
+
     def _raise(self, status: int, body: str) -> None:
         raise DownstreamError(status, body, classify_error(status, body))
 
