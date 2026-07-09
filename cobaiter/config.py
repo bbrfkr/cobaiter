@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # startup the registry is reconciled to exactly match it.
     models_config: str = ""
 
+    # Path to an externally-managed file (YAML/JSON) holding the difficulty
+    # exemplars — the small ``easy:`` / ``hard:`` task-phrase sets the classifier
+    # anchors task difficulty against (see cobaiter.classifier). Like the model
+    # registry and the difficulty anchors, these are deployment- and embedding-
+    # model-specific TUNING data (the classifier docstring notes they must be
+    # re-measured when the embedding model changes), so they belong in config, not
+    # code. Empty = use the built-in defaults baked into cobaiter.classifier.
+    difficulty_exemplars_config: str = ""
+
     # --- Routing ---
     # Virtual model name the agents call. Requests addressed to this model are routed.
     virtual_model: str = "cobaiter-auto"

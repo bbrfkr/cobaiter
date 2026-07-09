@@ -1,0 +1,58 @@
+# cobaiter difficulty exemplars (externally injected, hand-managed).
+#
+# The classifier estimates a task's DIFFICULTY (0..1) from where the task text
+# sits, by embedding cosine similarity, between these two small sets:
+#   ratio = sim_hard / (sim_hard + sim_easy)   (max cosine to each set)
+# then mapped to difficulty via the COBAITER_DIFFICULTY_*_ANCHOR settings.
+# The router folds difficulty into capability-fit + cost/tier re-ranking, so it
+# is difficulty that decides no-think vs think vs a pricier cloud model.
+#
+# These are DEPLOYMENT- and EMBEDDING-MODEL-specific tuning data: re-measure and
+# adjust them (and the anchors) if COBAITER_EMBEDDING_MODEL changes. Pointed to by
+# COBAITER_DIFFICULTY_EXEMPLARS_CONFIG; if unset, cobaiter uses the identical
+# built-in defaults baked into cobaiter/classifier.py.
+#
+# Guidance:
+#   * easy  : short greetings / simple lookups / trivial one-liners.
+#   * hard  : expert, multi-step, rigorous reasoning/analysis/design tasks,
+#             spanning MULTIPLE domains (math, physics, law, economics, statistics,
+#             software, ...) so difficulty generalises by meaning, not a keyword list.
+#   * Difficulty uses MAX cosine to each set, so ADDING a hard exemplar can only
+#     RAISE a task's sim_hard — keep hard exemplars clearly "expert/rigorous", not
+#     generic "explain topic X" (those would lift MEDIUM tasks too and blur the
+#     medium/hard boundary).
+#   * Phrase hard entries as generic DOMAIN ARCHETYPES, not verbatim of any single
+#     real task, to avoid the classifier over-fitting to exemplar-identical wording.
+#   * Cover non-software domains densely: with too few non-coding hard exemplars,
+#     coding hard tasks score a much higher sim_hard than equally-hard math/physics/
+#     law/economics/statistics tasks, so the latter never escalate.
+
+easy:
+  - "こんにちは"
+  - "ありがとうございます"
+  - "今日の天気は？"
+  - "元気ですか？"
+  - "了解しました"
+  - "1たす1は？"
+  - "フランスの首都はどこですか？"
+  - "この単語の意味を教えて"
+  - "おすすめのレシピを教えて"
+  - "今何時ですか？"
+
+hard:
+  # math
+  - "ある数学の予想がなぜ重要なのか、その理論的背景と証明の難しさを厳密に論じてください"
+  - "与えられた命題を厳密に証明し、各ステップの論理的正当性を示してください"
+  # physics
+  - "特殊相対性理論における同時性の相対性を、ローレンツ変換を用いて厳密に導出してください"
+  - "量子もつれが超光速の情報伝達に使えない理由を物理学的に厳密に説明してください"
+  # law
+  - "この契約に潜む法的リスクと、独占禁止法など関連法規に抵触する可能性を多角的に分析してください"
+  # economics
+  - "金融政策が長期金利・為替・資産価格に波及する経路を、メカニズムに分解して論じてください"
+  # statistics / science
+  - "統計データの有意性の解釈と、交絡因子やバイアスの可能性を批判的に検討してください"
+  - "科学的な現象の背後にあるメカニズムを、理論に基づいて厳密に説明してください"
+  # software
+  - "このシステムのメモリリークの原因を調査してデバッグしてください"
+  - "この分散システムのアーキテクチャ設計をレビューし、ボトルネックを特定してください"

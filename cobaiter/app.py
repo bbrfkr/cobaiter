@@ -15,6 +15,7 @@ from redis.exceptions import RedisError
 
 from .classifier import EmbeddingClassifier
 from .config import Settings, get_settings
+from .exemplars import ExemplarConfigError, load_difficulty_exemplars
 from .features import CONV_ID_HEADER, PRIVACY_HEADER, extract_constraints
 from .litellm_client import DownstreamError, LiteLLMClient
 from .registry import RegistryConfigError, load_model_registry
@@ -60,8 +61,10 @@ def create_app(
         app.state.settings = settings
         app.state.store = store or Store.from_url(settings)
         app.state.client = client or LiteLLMClient.create(settings)
+        easy_exemplars, hard_exemplars = _load_difficulty_exemplars(settings)
         app.state.classifier = classifier or EmbeddingClassifier(
-            app.state.client, settings
+            app.state.client, settings,
+            easy_exemplars=easy_exemplars, hard_exemplars=hard_exemplars,
         )
         app.state.engine = RouteEngine(
             app.state.store, app.state.client, app.state.classifier, settings
@@ -85,6 +88,26 @@ def create_app(
         if settings.models_config:
             return load_model_registry(settings.models_config)
         return default_seed_specs()
+
+    def _load_difficulty_exemplars(
+        settings: Settings,
+    ) -> tuple[list[str] | None, list[str] | None]:
+        """Load injected difficulty exemplars, or ``(None, None)`` to let the
+        classifier use its built-in defaults. Best-effort: a bad/missing file is
+        logged and falls back to defaults rather than blocking startup."""
+        if not settings.difficulty_exemplars_config:
+            return None, None
+        try:
+            easy, hard = load_difficulty_exemplars(settings.difficulty_exemplars_config)
+            log.info(
+                "difficulty exemplars loaded: %d easy, %d hard", len(easy), len(hard)
+            )
+            return easy, hard
+        except ExemplarConfigError as exc:
+            log.warning(
+                "difficulty exemplars config error (%s); using built-in defaults", exc
+            )
+            return None, None
 
     app = FastAPI(title="cobaiter", version="0.1.0", lifespan=lifespan)
 

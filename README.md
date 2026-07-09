@@ -248,6 +248,7 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `COBAITER_MODELS_CONFIG` | （空） | 外部レジストリファイル（YAML/JSON）のパス。**空＝内蔵デフォルトシード**。指定時は起動毎にこのファイルへ完全同期（未記載モデルは削除） |
+| `COBAITER_DIFFICULTY_EXEMPLARS_CONFIG` | （空） | 難易度推定に使う easy/hard 例文セットの外部ファイル（YAML/JSON）のパス。`easy:` と `hard:` の2リストを持つ。**空＝`cobaiter/classifier.py` の内蔵デフォルト**。embedding モデルを変えたら anchor と併せて再測定・調整する |
 
 ### ルーティング
 

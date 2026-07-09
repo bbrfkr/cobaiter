@@ -29,6 +29,8 @@ services:
     volumes:
       # Externally-managed model registry (hand-tuned mapping of model -> tier/caps).
       - ./models.yaml:/app/models.yaml:ro
+      # Externally-managed difficulty exemplars (easy/hard task-phrase sets).
+      - ./difficulty_exemplars.yaml:/app/difficulty_exemplars.yaml:ro
     environment:
       # Valkey runs as a compose service; override only the in-cluster hostname.
       # COBAITER_LITELLM_BASE_URL is intentionally NOT set here so the value from
