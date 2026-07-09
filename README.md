@@ -257,6 +257,8 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | `COBAITER_EMBEDDING_MODEL` | `text-embedding-3-small` | relevance スコアリングに使う embedding モデル（LiteLLM の `/v1/embeddings` 経由）。**レジストリには含めない**（ルーティング対象外） |
 | `COBAITER_EMBEDDING_REL_BAND` | `0.10` | relevance のコントラスト帯域。最良候補との cosine 類似度差がこの値に達すると relevance 0.0。小さいほどドメイン分離が鋭くなる |
 | `COBAITER_CLASSIFIER_DIGEST_CHARS` | `400` | embedding するタスクダイジェスト（会話の先頭＋末尾）の最大文字数 |
+| `COBAITER_DIFFICULTY_EASY_ANCHOR` | `0.22` | difficulty 算出の easy 側アンカー。`ratio = sim_hard/(sim_hard+sim_easy)` がこの値以下で difficulty=0.15。embedding モデル依存につき変更時は再計測が必要 |
+| `COBAITER_DIFFICULTY_HARD_ANCHOR` | `0.70` | difficulty 算出の hard 側アンカー。`ratio` がこの値以上で difficulty=0.85（間は線形補間） |
 | `COBAITER_DEFAULT_MODEL` | `claude-haiku-4-5` | どの候補も制約を満たさないときの安全なフォールバック先 |
 
 ### 会話スティッキー / ヒステリシス
@@ -270,6 +272,17 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | `COBAITER_SWITCH_MARGIN` | `0.15` | 切替に必要な「最良候補スコア − 固定モデルスコア」の優位差。小さいほど切り替わりやすい |
 | `COBAITER_SOFT_RECHECK_EVERY` | `4` | 変化トリガが無くても N ユーザーターン毎に分類器で定期再評価する周期 |
 | `COBAITER_SCORE_EMA_ALPHA` | `0.5` | 固定モデルスコアの EMA 平滑係数（0..1、大きいほど直近に反応） |
+
+### コスト / tier 加味の選択
+
+`effective = suitability - (cost_bias*(cost/maxCost) + tier_bias*(tier/maxTier)) * (1 - difficulty)`。cost_bias > tier_bias を保つ（「コストで決め、tier で重み付け」）。
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_COST_BIAS` | `0.4` | コスト/tier 再ランキングにおけるコストへの重み。大きいほど無料/ローカルモデルを優先 |
+| `COBAITER_TIER_BIAS` | `0.1` | 同上、tier（軽量さ）への重み。大きいほど軽量な variant を優先 |
+| `COBAITER_CAPABILITY_REL_FRACTION` | `0.5` | capability-fit で maxTier に含める候補を絞るしきい値（最良 relevance に対する比率）。domain 外の重量級モデルが maxTier を吊り上げるのを防ぐ |
+| `COBAITER_CAPABILITY_CURVE` | `2.0` | capability-fit 計算で difficulty に掛ける指数。`capability_fit = 1 - max(0, difficulty**curve - tier/maxTier)`。curve>1 は低〜中難度でのペナルティ発生を遅らせる |
 
 ### ログ / 再キャリブレーション
 
@@ -286,6 +299,12 @@ curl -s -D- localhost:8000/v1/chat/completions \
 | --- | --- | --- |
 | `COBAITER_CREDIT_FLOOR` | `0.0` | 残クレジット余力（USD）がこの値を下回るモデルは不可用として候補から除外 |
 | `COBAITER_CREDIT_CACHE_TTL` | `30` | LiteLLM の budget/spend 参照結果のキャッシュ TTL（秒） |
+
+### ログレベル
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `COBAITER_LOG_LEVEL` | `DEBUG` | `cobaiter` ロガーのレベル（`DEBUG`/`INFO`/`WARNING`/`ERROR`） |
 
 ### HTTP サーバ / クライアント
 
