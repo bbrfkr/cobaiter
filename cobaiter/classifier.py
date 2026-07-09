@@ -12,9 +12,10 @@ callers that fan one user instruction into many API calls. This version keeps
 the relevance/difficulty two-axis design but computes both without a generative
 LLM, from embeddings served through the LiteLLM gateway:
 
-* ``relevance``   — cosine similarity between the task text and each
-  candidate's use-case ``description``. Description vectors are cached
-  in-process.
+* ``relevance``   — top-2-mean cosine similarity between the task text and
+  each candidate's use-case reference texts (``ModelSpec.task_examples``, or
+  its ``description`` as a single-item fallback). Reference vectors are
+  cached in-process.
 * ``difficulty``  — where the task text sits, by cosine similarity, between
   two small fixed sets of "easy" and "hard" example tasks spanning MULTIPLE
   domains (math, coding, science, law, ...), not just coding. A keyword list
@@ -72,10 +73,11 @@ class EmbeddingClassifier:
     def __init__(self, client: LiteLLMClient, settings: Settings) -> None:
         self._client = client
         self._s = settings
-        # description / exemplar text -> embedding vector. Both sets are small
-        # and stable per process (registry descriptions, fixed exemplar list),
-        # so a plain dict cache never needs eviction.
-        self._desc_vecs: dict[str, list[float]] = {}
+        # reference text (a model's task_examples, or its description as a
+        # single-item fallback) / exemplar text -> embedding vector. Both sets
+        # are small and stable per process (registry data, fixed exemplar
+        # list), so a plain dict cache never needs eviction.
+        self._ref_vecs: dict[str, list[float]] = {}
         self._exemplar_vecs: dict[str, list[float]] = {}
 
     async def score(
@@ -90,7 +92,7 @@ class EmbeddingClassifier:
         latest_user = _strip_edge_punct(latest_user)
         task_text = _task_text(latest_user, self._s.classifier_digest_chars)
 
-        task_vec, rels, raw_sims = await self._embed_and_score_relevance(
+        task_vec, rels, raw_sims, refs_per_candidate = await self._embed_and_score_relevance(
             task_text, candidates
         )
         if rels is None:
@@ -113,10 +115,17 @@ class EmbeddingClassifier:
         # fallback values already reflected in ``scores``/``difficulty``.
         diagnostics = None
         if task_vec is not None:
+            raw_sims = raw_sims or []
+            refs_per_candidate = refs_per_candidate or []
             diagnostics = ClassifierDiagnostics(
                 task_text=task_text or None,
                 candidate_sims={
-                    c.model: s for c, s in zip(candidates, raw_sims or []) if s is not None
+                    c.model: s for c, s in zip(candidates, raw_sims) if s is not None
+                },
+                candidate_refs={
+                    c.model: [_truncate_ref(r) for r in refs]
+                    for c, refs, s in zip(candidates, refs_per_candidate, raw_sims)
+                    if s is not None
                 },
                 sim_easy=sim_easy,
                 sim_hard=sim_hard,
@@ -131,22 +140,32 @@ class EmbeddingClassifier:
     # ------------------------------------------------------------------ #
     async def _embed_and_score_relevance(
         self, task_text: str, candidates: list[ModelSpec]
-    ) -> tuple[list[float] | None, list[float] | None, list[float | None] | None]:
-        """Embed the task text (+ any not-yet-cached descriptions/exemplars) in
-        ONE batched call. Returns ``(task_vec, relevance, raw_sims)``; each may be
-        ``None`` on failure or empty input — the caller degrades each
-        independently (difficulty still works without descriptions, relevance
-        just falls back to neutral). ``raw_sims`` is the pre-``_spread`` cosine
+    ) -> tuple[
+        list[float] | None,
+        list[float] | None,
+        list[float | None] | None,
+        list[list[str]] | None,
+    ]:
+        """Embed the task text (+ any not-yet-cached reference texts/exemplars)
+        in ONE batched call. Returns ``(task_vec, relevance, raw_sims,
+        refs_per_candidate)``; the first three may be ``None`` on failure or
+        empty input — the caller degrades each independently (difficulty still
+        works without reference texts, relevance just falls back to neutral).
+        ``raw_sims`` is the pre-``relevance_from_sims`` top-2-mean cosine
         similarity per candidate (diagnostics only, logged for offline
-        recalibration of ``embedding_rel_band``)."""
+        recalibration of ``embedding_rel_band``); ``refs_per_candidate`` is the
+        RESOLVED reference texts (see ``_resolve_refs``) used for each
+        candidate, also logged (as ``candidate_refs``) for the same offline
+        recalibration to know which domain each candidate actually represented."""
         if not task_text.strip():
-            return None, None, None
-        descs = [c.description.strip() for c in candidates]
-        missing_desc = [d for d in dict.fromkeys(descs) if d and d not in self._desc_vecs]
+            return None, None, None, None
+        refs_per_candidate = [_resolve_refs(c) for c in candidates]
+        all_refs = [r for refs in refs_per_candidate for r in refs]
+        missing_refs = [r for r in dict.fromkeys(all_refs) if r not in self._ref_vecs]
         missing_exemplars = [
             e for e in _DIFFICULTY_EXEMPLARS if e not in self._exemplar_vecs
         ]
-        batch = [task_text] + missing_desc + missing_exemplars
+        batch = [task_text] + missing_refs + missing_exemplars
         try:
             vecs = await self._client.embed(self._s.embedding_model, batch)
             if len(vecs) != len(batch):
@@ -160,14 +179,17 @@ class EmbeddingClassifier:
                 "and fallback difficulty",
                 self._s.embedding_model, exc,
             )
-            return None, None, None
+            return None, None, None, None
         task_vec = vecs[0]
-        self._desc_vecs.update(zip(missing_desc, vecs[1 : 1 + len(missing_desc)]))
-        self._exemplar_vecs.update(zip(missing_exemplars, vecs[1 + len(missing_desc) :]))
+        self._ref_vecs.update(zip(missing_refs, vecs[1 : 1 + len(missing_refs)]))
+        self._exemplar_vecs.update(zip(missing_exemplars, vecs[1 + len(missing_refs) :]))
 
-        if not any(descs):
-            return task_vec, None, None
-        sims = [_cosine(task_vec, self._desc_vecs[d]) if d else None for d in descs]
+        if not all_refs:
+            return task_vec, None, None, refs_per_candidate
+        sims = [
+            _multi_sim(task_vec, [self._ref_vecs[r] for r in refs]) if refs else None
+            for refs in refs_per_candidate
+        ]
         log.debug(
             "classify(raw): embedding_model=%s sims=%s",
             self._s.embedding_model,
@@ -176,7 +198,12 @@ class EmbeddingClassifier:
                 for c, s in zip(candidates, sims)
             ),
         )
-        return task_vec, _spread(sims, self._s.embedding_rel_band), sims
+        return (
+            task_vec,
+            relevance_from_sims(sims, self._s.embedding_rel_band),
+            sims,
+            refs_per_candidate,
+        )
 
     # ------------------------------------------------------------------ #
     def _difficulty(
@@ -336,6 +363,41 @@ def _fallback_difficulty(latest_user_msg: dict[str, Any] | None) -> float:
 # Helpers
 # --------------------------------------------------------------------------- #
 _NEUTRAL_SUITABILITY = 0.5
+# Number of a candidate's reference texts (task_examples, or the 1-item
+# description fallback) averaged for relevance. With exactly 1 reference (the
+# fallback case) this reduces to a plain cosine similarity — byte-for-byte the
+# old single-description behaviour. With more, top-2-mean damps the per-example
+# embedding brittleness this module already documents (see ``_EDGE_PUNCT``)
+# and avoids a candidate winning purely by having more task_examples than a
+# rival (more prototypes -> a higher expected max by chance alone).
+_RELEVANCE_TOP_K = 2
+# Cap on each reference string logged into ClassifierDiagnostics.candidate_refs
+# (decision log size safety; embedding itself uses the untruncated text).
+_REF_LOG_CHARS = 200
+
+
+def _resolve_refs(spec: ModelSpec) -> list[str]:
+    """Reference texts used to score ``spec``'s relevance: its
+    ``task_examples`` if set, else a single-item list wrapping ``description``
+    (byte-for-byte the old single-vector behaviour when task_examples is
+    empty)."""
+    examples = [e.strip() for e in spec.task_examples if e.strip()]
+    if examples:
+        return examples
+    desc = spec.description.strip()
+    return [desc] if desc else []
+
+
+def _multi_sim(task_vec: list[float], vecs: list[list[float]]) -> float:
+    """Top-``_RELEVANCE_TOP_K``-mean cosine similarity between the task vector
+    and a candidate's reference vectors."""
+    sims = sorted((_cosine(task_vec, v) for v in vecs), reverse=True)
+    top = sims[:_RELEVANCE_TOP_K]
+    return sum(top) / len(top)
+
+
+def _truncate_ref(text: str) -> str:
+    return text if len(text) <= _REF_LOG_CHARS else text[:_REF_LOG_CHARS] + "…"
 
 
 def _fmt_scores(result: ClassifierResult) -> str:
@@ -353,16 +415,22 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / math.sqrt(na * nb)
 
 
-def _spread(sims: list[float | None], band: float) -> list[float]:
+def relevance_from_sims(sims: list[float | None], band: float) -> list[float]:
     """Map cosine similarities to 0..1 relevance.
+
+    Public (unlike the rest of this module's helpers) so ``cobaiter.calibrate``
+    can re-simulate different ``embedding_rel_band`` values against already-
+    logged raw similarities without duplicating this normalisation — mirrors
+    why ``difficulty_from_ratio`` is public.
 
     Raw cosine values sit in a model-dependent compressed band (unrelated texts
     rarely score near 0), so absolute similarity is meaningless to the router.
     Anchor on the best candidate instead: the top similarity maps to relevance
     1.0 and a full ``band`` of similarity deficit costs the whole relevance
-    range. Same-domain candidates share one description (identical similarity)
+    range. Same-domain candidates share reference texts (identical similarity)
     and stay tied at 1.0, leaving tier/cost to decide; a different-domain
-    description falls off fast. Candidates without a description score neutral.
+    candidate falls off fast. Candidates without any reference text score
+    neutral.
     """
     band = max(band, 1e-6)
     top = max(s for s in sims if s is not None)

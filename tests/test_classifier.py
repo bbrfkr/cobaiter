@@ -31,6 +31,19 @@ _EASY_POINT = [1.0, 0.0]
 _HARD_POINT = [0.0, 1.0]
 _MID_POINT = [0.70710678, 0.70710678]  # equidistant -> ratio == 0.5
 
+# Extra fixed points (unit vectors at known angles from [1.0, 0.0], the fake
+# space's "coding" axis) used ONLY by the multi-prototype relevance tests
+# below, so a candidate's task_examples can be given precise, distinct raw
+# cosine similarities to a coding-marked task digest — something the
+# EASY/HARD/MID points (shared with the difficulty tests) don't offer enough
+# distinct values for.
+_REL_VECTORS = {
+    "REL_MARKER_90": [0.9, 0.4358898943540674],   # cos to [1,0] == 0.9
+    "REL_MARKER_60": [0.6, 0.8],                   # cos to [1,0] == 0.6
+    "REL_MARKER_50": [0.5, 0.8660254037844386],    # cos to [1,0] == 0.5
+    "REL_MARKER_00": [0.0, 1.0],                   # cos to [1,0] == 0.0
+}
+
 
 def _vec(text: str) -> list[float]:
     if text in _EASY_EXEMPLARS:
@@ -43,6 +56,9 @@ def _vec(text: str) -> list[float]:
         return _HARD_POINT
     if "MID_TASK_MARKER" in text:
         return _MID_POINT
+    for marker, vec in _REL_VECTORS.items():
+        if marker in text:
+            return vec
     t = text.lower()
     if any(k in t for k in _CODING_MARKERS):
         return [1.0, 0.0]
@@ -214,6 +230,91 @@ async def test_no_descriptions_means_neutral_relevance_but_difficulty_still_work
     await http.aclose()
 
 
+# --- relevance: task_examples multi-prototype scoring ----------------------- #
+async def test_relevance_uses_top2_mean_over_task_examples():
+    """A candidate with 3 task_examples at raw cosine [0.9, 0.5, 0.0] to the
+    task digest scores top-2-mean = (0.9+0.5)/2 = 0.7 — not diluted by the
+    weak third example (plain mean would give ~0.467), and not just the best
+    match either (plain max would give 0.9)."""
+    seen: list[dict[str, Any]] = []
+    clf, http = _make_classifier(seen)
+    candidates = [
+        ModelSpec(
+            model="m-multi",
+            task_examples=["REL_MARKER_90 ex", "REL_MARKER_50 ex", "REL_MARKER_00 ex"],
+        ),
+    ]
+    result = await clf.score(_req("please look at this code"), candidates)
+    assert result.raw is not None
+    assert abs(result.raw.candidate_sims["m-multi"] - 0.7) < 1e-6
+    await http.aclose()
+
+
+async def test_relevance_falls_back_to_description_when_task_examples_empty():
+    """Backward compatibility pin: with task_examples empty, relevance is
+    scored from `description` alone (top-1-mean of a single item == a plain
+    cosine similarity) — byte-for-byte the pre-task_examples behaviour."""
+    seen: list[dict[str, Any]] = []
+    clf, http = _make_classifier(seen)
+    candidates = [ModelSpec(model="m-desc-only", description="REL_MARKER_60 desc")]
+    result = await clf.score(_req("please look at this code"), candidates)
+    assert result.raw is not None
+    assert abs(result.raw.candidate_sims["m-desc-only"] - 0.6) < 1e-6
+    assert result.raw.candidate_refs["m-desc-only"] == ["REL_MARKER_60 desc"]
+    await http.aclose()
+
+
+async def test_relevance_multi_example_candidate_does_not_win_purely_on_example_count():
+    """Regression for the item-1 bias concern: a candidate with 1 example that
+    matches moderately well (cos=0.6) must beat a rival with 5 examples where
+    only 1 matches equally well and the other 4 are irrelevant (cos=0.0) —
+    with plain max() both would tie at 0.6; top-2-mean penalises the
+    many-irrelevant-examples candidate (mean of its top 2 = 0.3)."""
+    seen: list[dict[str, Any]] = []
+    clf, http = _make_classifier(seen)
+    candidates = [
+        ModelSpec(model="m-focused", task_examples=["REL_MARKER_60 ex"]),
+        ModelSpec(
+            model="m-many",
+            task_examples=[
+                "REL_MARKER_60 ex",
+                "REL_MARKER_00 ex a",
+                "REL_MARKER_00 ex b",
+                "REL_MARKER_00 ex c",
+                "REL_MARKER_00 ex d",
+            ],
+        ),
+    ]
+    result = await clf.score(_req("please look at this code"), candidates)
+    assert result.raw is not None
+    sims = result.raw.candidate_sims
+    assert abs(sims["m-focused"] - 0.6) < 1e-6
+    assert abs(sims["m-many"] - 0.3) < 1e-6
+    assert sims["m-focused"] > sims["m-many"]
+    await http.aclose()
+
+
+async def test_relevance_task_examples_are_embedded_individually_and_cached():
+    """Mirrors test_shared_description_is_deduped_and_cached but for
+    task_examples: each distinct example text is its own embedding entry on
+    first use, and only the digest is re-embedded on a later call (examples
+    cached)."""
+    seen: list[dict[str, Any]] = []
+    clf, http = _make_classifier(seen)
+    candidates = [
+        ModelSpec(model="m", task_examples=["REL_MARKER_90 ex1", "REL_MARKER_50 ex2"]),
+    ]
+    exemplar_count = len(_EASY_EXEMPLARS) + len(_HARD_EXEMPLARS)
+    await clf.score(_req("please look at this code"), candidates)
+    # digest + 2 distinct (not-yet-cached) examples + all exemplars.
+    assert len(seen[0]["input"]) == 3 + exemplar_count
+
+    await clf.score(_req("please look at this code"), candidates)
+    # examples + exemplars now cached; only the digest is embedded.
+    assert len(seen[1]["input"]) == 1
+    await http.aclose()
+
+
 # --- difficulty: LOW_INTENT fast path (no embedding needed) ---------------- #
 def _classifier() -> EmbeddingClassifier:
     return EmbeddingClassifier(client=None, settings=Settings(_env_file=None))
@@ -365,6 +466,9 @@ async def test_raw_diagnostics_populated_on_success():
     assert result.raw is not None
     assert result.raw.task_text == "このコードのバグを直して"
     assert result.raw.candidate_sims == {"m-coding": 1.0, "m-general": 0.0}
+    assert result.raw.candidate_refs == {
+        "m-coding": ["ソフトウェア開発向け"], "m-general": ["一般対話向け"],
+    }
     assert result.raw.sim_easy == 1.0
     assert result.raw.sim_hard == 0.0
     await http.aclose()

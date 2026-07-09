@@ -1,0 +1,77 @@
+# Golden set for tests/test_routing_golden.py — a regression check for the REAL
+# embedding classifier + REAL models.yaml registry (not the deterministic fake
+# embedding space used by tests/test_classifier.py). Requires a live LiteLLM
+# gateway with /v1/embeddings configured; see COBAITER_RUN_GOLDEN in the test
+# module's docstring.
+#
+# Each case:
+#   name             : unique id, also used as the conversation header
+#   message           : the (single-turn) user message to route
+#   acceptable_models : decision.model must be one of these (empty/omitted = no check)
+#   avoid_models       : decision.model must NOT be one of these (empty/omitted = no check)
+#
+# References concrete model names from the repo-root models.yaml — if that
+# registry's model set changes, this file needs a matching manual update (the
+# golden test does not run in CI by default, so this is a low-cost coupling).
+#
+# Cases intentionally include domain-adjacent ("boundary") messages, not just
+# clear-cut ones — see the cobaiter-multi-domain-routing project memory: relevance
+# separation must keep working as more domains are added, and boundary cases are
+# exactly where a regression would first show up.
+
+cases:
+  - name: trivial_greeting
+    message: "こんにちは"
+    acceptable_models: [bbrfkr-llm-general-no-think]
+    avoid_models: [gpt-5.5, claude-sonnet-5, bbrfkr-llm-coding, bbrfkr-llm-coding-no-think]
+
+  - name: coding_bugfix
+    message: |
+      このPythonコードのバグを直してください:
+
+      def add(a, b):
+          return a - b
+    acceptable_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+    avoid_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+
+  - name: coding_review
+    message: |
+      この関数のコードレビューをお願いします:
+
+      function sum(a, b) { return a + b }
+    acceptable_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+    avoid_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+
+  - name: architecture_design
+    message: "分散システムのアーキテクチャ設計についてアドバイスが欲しいです。マイクロサービス間の通信方式で悩んでいます。"
+    acceptable_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+    avoid_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+
+  - name: ci_cd_investigation
+    message: "GitHub ActionsのCI/CDパイプラインが失敗しています。原因を調査してほしい。"
+    acceptable_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+    avoid_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+
+  - name: translation_task
+    message: "この英文を日本語に翻訳してください: 'The quick brown fox jumps over the lazy dog.'"
+    acceptable_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+    avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+
+  - name: travel_planning
+    message: "来週の京都旅行のプランを一緒に考えてほしいです。おすすめの観光地はありますか？"
+    acceptable_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+    avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+
+  # Domain-adjacent boundary case: mentions "API" (coding-flavoured vocabulary)
+  # but the actual ask is a pricing/business question, not a coding task.
+  - name: domain_adjacent_api_pricing
+    message: "このAPIの料金体系について教えてください。従量課金と定額プランの違いも知りたいです。"
+    acceptable_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
+    avoid_models: []
+
+  # Hard, general-domain task: difficulty should be high, but domain relevance
+  # must still land in the general group, not coding.
+  - name: hard_general_reasoning
+    message: "マクロ経済政策が為替レートに与える影響について、複数の理論的視点から多角的に論じてください。"
+    acceptable_models: [gpt-5.5, bbrfkr-llm-general, bbrfkr-llm-general-no-think]
+    avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]

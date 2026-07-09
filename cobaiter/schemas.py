@@ -42,6 +42,17 @@ class ModelSpec(BaseModel):
     # a domain should share the SAME description (they then tie on relevance) and
     # be distinguished by ``tier``/``cost``.
     description: str = ""
+    # Short, representative task phrases for this model's use-case domain (same
+    # content rules as ``description``: positively stated, domain-only, shared
+    # across a domain's tier variants). When non-empty, relevance is scored as
+    # the top-2-mean cosine similarity between the task text and EACH example
+    # (multi-prototype matching) instead of a single description vector — this
+    # damps the per-example embedding brittleness already observed in this
+    # codebase (see classifier.py's ``_EDGE_PUNCT`` handling) and avoids letting
+    # a domain win purely by having more examples than a rival domain. When
+    # empty, relevance falls back to treating ``description`` as a single
+    # one-item example list (byte-for-byte the old single-vector behaviour).
+    task_examples: list[str] = Field(default_factory=list)
     # Ordered list of alternates to try when this model becomes unavailable.
     fallback_chain: list[str] = Field(default_factory=list)
 
@@ -150,6 +161,15 @@ class ClassifierDiagnostics(BaseModel):
     task_text: str | None = None
     # model -> raw cosine similarity to that model's registry description.
     candidate_sims: dict[str, float] = Field(default_factory=dict)
+    # model -> the RESOLVED reference texts actually compared at decision time
+    # (``task_examples`` if set, else ``[description]``; see ``ModelSpec``),
+    # truncated per-string for log-size safety (see classifier.py's
+    # ``_REF_LOG_CHARS``). This is registry metadata, not user conversation
+    # content, so — unlike ``task_text`` — it is NEVER redacted for privacy
+    # (``needs_local``) conversations. Consumed by ``cobaiter.calibrate`` to
+    # group candidates sharing a domain and ask a judge which domain was
+    # actually correct, for automatic ``embedding_rel_band`` recalibration.
+    candidate_refs: dict[str, list[str]] = Field(default_factory=dict)
     # Max cosine similarity of the task text to the easy/hard difficulty exemplar
     # sets (see classifier.py); ``None`` when the exemplar-based estimate wasn't
     # used (e.g. the low-intent shortcut or token-count fallback fired instead).

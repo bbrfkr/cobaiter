@@ -9,10 +9,14 @@ from cobaiter.schemas import ClassifierDiagnostics, ModelSpec, Route
 from conftest import convo_req, user_req
 
 
-def _diagnostics(task_text: str = "write a poem") -> ClassifierDiagnostics:
+def _diagnostics(
+    task_text: str = "write a poem",
+    candidate_refs: dict[str, list[str]] | None = None,
+) -> ClassifierDiagnostics:
     return ClassifierDiagnostics(
         task_text=task_text,
         candidate_sims={"claude-opus-4-8": 0.8, "claude-sonnet-4-6": 0.3},
+        candidate_refs=candidate_refs or {},
         sim_easy=0.2,
         sim_hard=0.6,
     )
@@ -90,7 +94,8 @@ async def test_privacy_conversation_redacts_task_text(engine, classifier):
     await engine._store.put_model(local_a)
     await engine._store.put_model(local_b)
     classifier.table = {"local-a": 0.9, "local-b": 0.5}
-    classifier.raw = _diagnostics("this is sensitive task text")
+    refs = {"local-a": ["general A"], "local-b": ["general B"]}
+    classifier.raw = _diagnostics("this is sensitive task text", candidate_refs=refs)
 
     req = user_req("sensitive stuff", metadata={"privacy": True})
     d = await engine.decide(req, header_id="c1")
@@ -103,6 +108,9 @@ async def test_privacy_conversation_redacts_task_text(engine, classifier):
     # Non-text signal (needed for calibration's OLS fit) is still logged.
     assert entries[0].diagnostics.sim_easy == 0.2
     assert entries[0].diagnostics.sim_hard == 0.6
+    # candidate_refs is registry metadata, not user conversation content — it
+    # must NOT be redacted even for a privacy-flagged conversation.
+    assert entries[0].diagnostics.candidate_refs == refs
 
 
 async def test_context_switch_logs_a_decision(engine, classifier):

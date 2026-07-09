@@ -40,3 +40,6 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore::DeprecationWarning:starlette.testclient",
 ]
+markers = [
+    "golden: requires a live LiteLLM/embedding backend; opt in with COBAITER_RUN_GOLDEN=1",
+]
