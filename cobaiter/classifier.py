@@ -70,9 +70,27 @@ class EmbeddingClassifier:
     hard-fails on the classifier.
     """
 
-    def __init__(self, client: LiteLLMClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        client: LiteLLMClient,
+        settings: Settings,
+        *,
+        easy_exemplars: list[str] | None = None,
+        hard_exemplars: list[str] | None = None,
+    ) -> None:
         self._client = client
         self._s = settings
+        # Difficulty exemplars: injected (from Settings.difficulty_exemplars_config
+        # via the app layer) or, when not configured, the built-in defaults below.
+        # Defaults resolve at call time — not as argument defaults — because the
+        # module-level constants are defined further down this file.
+        self._easy_exemplars = (
+            list(easy_exemplars) if easy_exemplars is not None else list(_EASY_EXEMPLARS)
+        )
+        self._hard_exemplars = (
+            list(hard_exemplars) if hard_exemplars is not None else list(_HARD_EXEMPLARS)
+        )
+        self._difficulty_exemplars = self._easy_exemplars + self._hard_exemplars
         # reference text (a model's task_examples, or its description as a
         # single-item fallback) / exemplar text -> embedding vector. Both sets
         # are small and stable per process (registry data, fixed exemplar
@@ -163,7 +181,7 @@ class EmbeddingClassifier:
         all_refs = [r for refs in refs_per_candidate for r in refs]
         missing_refs = [r for r in dict.fromkeys(all_refs) if r not in self._ref_vecs]
         missing_exemplars = [
-            e for e in _DIFFICULTY_EXEMPLARS if e not in self._exemplar_vecs
+            e for e in self._difficulty_exemplars if e not in self._exemplar_vecs
         ]
         batch = [task_text] + missing_refs + missing_exemplars
         try:
@@ -231,8 +249,8 @@ class EmbeddingClassifier:
         if _LOW_INTENT.search(intent):
             return 0.15, None, None
 
-        easy_vecs = [self._exemplar_vecs[e] for e in _EASY_EXEMPLARS if e in self._exemplar_vecs]
-        hard_vecs = [self._exemplar_vecs[e] for e in _HARD_EXEMPLARS if e in self._exemplar_vecs]
+        easy_vecs = [self._exemplar_vecs[e] for e in self._easy_exemplars if e in self._exemplar_vecs]
+        hard_vecs = [self._exemplar_vecs[e] for e in self._hard_exemplars if e in self._exemplar_vecs]
         if task_vec is None or not easy_vecs or not hard_vecs:
             return _fallback_difficulty(latest_user_msg), None, None
 
@@ -270,12 +288,33 @@ _EASY_EXEMPLARS = [
     "おすすめのレシピを教えて",
     "今何時ですか？",
 ]
+# Denser coverage of NON-coding expert domains (math / physics / law / economics /
+# statistics-science) alongside the two software ones. Measured on the live
+# embedding model: with only 2 of 6 hard exemplars being coding-flavoured, general
+# hard tasks (proofs, physics derivations, legal/economic/statistical analysis)
+# scored a much weaker sim_hard than coding hard tasks (~0.50 vs ~0.58), so their
+# difficulty ratio never separated from general *medium* and they never escalated.
+# Adding domain-archetype (not eval-copy) hard exemplars per expert domain lifted
+# general-hard escalation from 0/7 to 5/7 on a 31-prompt eval while keeping general
+# medium at 0/5 (no false escalation) and coding hard unchanged at 2/6. Phrased as
+# generic domain archetypes (e.g. "ある数学の予想…") — NOT verbatim of any single
+# task — to avoid the exemplar-verbatim overfitting the router already suffers from.
 _HARD_EXEMPLARS = [
-    "ゲーデルの不完全性定理を証明してください",
+    # math
+    "ある数学の予想がなぜ重要なのか、その理論的背景と証明の難しさを厳密に論じてください",
+    "与えられた命題を厳密に証明し、各ステップの論理的正当性を示してください",
+    # physics
+    "特殊相対性理論における同時性の相対性を、ローレンツ変換を用いて厳密に導出してください",
+    "量子もつれが超光速の情報伝達に使えない理由を物理学的に厳密に説明してください",
+    # law
+    "この契約に潜む法的リスクと、独占禁止法など関連法規に抵触する可能性を多角的に分析してください",
+    # economics
+    "金融政策が長期金利・為替・資産価格に波及する経路を、メカニズムに分解して論じてください",
+    # statistics / science
+    "統計データの有意性の解釈と、交絡因子やバイアスの可能性を批判的に検討してください",
+    "科学的な現象の背後にあるメカニズムを、理論に基づいて厳密に説明してください",
+    # software
     "このシステムのメモリリークの原因を調査してデバッグしてください",
-    "量子もつれが超光速通信に使えない理由を物理学的に説明してください",
-    "この契約書に潜む法的リスクを分析してください",
-    "マクロ経済政策が為替レートに与える影響を多角的に論じてください",
     "この分散システムのアーキテクチャ設計をレビューし、ボトルネックを特定してください",
 ]
 _DIFFICULTY_EXEMPLARS = _EASY_EXEMPLARS + _HARD_EXEMPLARS
