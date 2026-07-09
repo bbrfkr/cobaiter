@@ -75,3 +75,28 @@ cases:
     message: "マクロ経済政策が為替レートに与える影響について、複数の理論的視点から多角的に論じてください。"
     acceptable_models: [gpt-5.5, bbrfkr-llm-general, bbrfkr-llm-general-no-think]
     avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+
+  # Domain-adjacent boundary case: natural-science proof. Vocabulary ("量子ビット",
+  # "複製", "証明") sits near coding in the embedding space, but this is a physics
+  # question, not a software task — it must land in the general group.
+  - name: science_proof
+    message: "量子力学において、量子ビットを複製できないことを証明してください。"
+    acceptable_models: [gpt-5.5, bbrfkr-llm-general, bbrfkr-llm-general-no-think]
+    avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+
+  # Domain-adjacent boundary case: statistical INTERPRETATION of data ("データ",
+  # "分析") reads as coding-flavoured, but the ask is reasoning about results, not
+  # writing data-processing code — it belongs in the general group. Its coding
+  # twin (data_aggregation_code below) must go the other way, so the two together
+  # pin the general/coding split right on the data-analysis boundary.
+  - name: statistical_analysis
+    message: "このアンケート調査の統計データを分析して、傾向を解釈してください。"
+    acceptable_models: [gpt-5.5, bbrfkr-llm-general, bbrfkr-llm-general-no-think]
+    avoid_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+
+  # Coding twin of statistical_analysis: same data subject, but the ask is to
+  # WRITE code that processes the data — this must land in the coding group.
+  - name: data_aggregation_code
+    message: "CSVの売上データを集計するPythonスクリプトを書いてください。"
+    acceptable_models: [bbrfkr-llm-coding, bbrfkr-llm-coding-no-think, claude-sonnet-5]
+    avoid_models: [bbrfkr-llm-general, bbrfkr-llm-general-no-think, gpt-5.5]
