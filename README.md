@@ -333,6 +333,21 @@ COBAITER_RUN_GOLDEN=1 uv run pytest -m golden -v
 `models.yaml` の description/task_examples・embedding モデル・`COBAITER_EMBEDDING_REL_BAND` や difficulty
 アンカーを変更したときは、このgolden setを実行してルーティング結果が壊れていないか確認してください。
 
+## ルーティングのチューニング（tools/）
+
+難易度・エスカレーション（軽量ローカル / think / クラウド振り分け）を調整するための開発用ツール群を
+[`tools/`](./tools/) に用意しています。`tools/eval_prompts.yaml`（ドメイン×難易度の評価プロンプト集）を
+共有し、**オフライン予測**（実 classifier/router＋実 embedding で `sim_router` / `measure_difficulty` /
+`exp_exemplars`）→ **サーバ適用**（`docker compose up -d --force-recreate cobaiter`）→ **live 検証**
+（`validate_routing`）というループでチューニングできます。詳細は [tools/README.md](./tools/README.md)。
+
+```bash
+# 例: (anchors, curve, cost_bias) を変えたときのエスカレーションをオフライン予測
+python -m tools.sim_router --easy-anchor 0.412 --hard-anchor 0.702 --curve 1.2 --cost-bias 0.3,0.2,0.1
+# 適用後に実サーバのルーティングを検証
+python -m tools.validate_routing --base-url http://SERVER:8080
+```
+
 ## 留意点
 
 - クレジット余力・予算・spend は LiteLLM に委譲（cobaiter は参照のみ）。
