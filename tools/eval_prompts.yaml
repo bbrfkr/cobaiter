@@ -1,0 +1,54 @@
+# Evaluation prompt set for the routing-tuning tools (tools/README.md).
+#
+# A domain (general / coding) x difficulty (easy / medium / hard) grid with
+# VARIED phrasing — deliberately NOT verbatim copies of the classifier's
+# difficulty exemplars — so it can measure whether genuinely-hard tasks escalate
+# without over-fitting to the exemplars. Extend it freely; keep the domain/level
+# labels so the summaries stay meaningful.
+
+prompts:
+  # ---- general: easy ----
+  - {domain: general, level: easy, text: "おはよう、今日は調子どう？"}
+  - {domain: general, level: easy, text: "犬と猫、ペットとして飼うならどっちがおすすめ？"}
+  - {domain: general, level: easy, text: "コーヒーと紅茶、朝に飲むならどっちがいいかな"}
+  - {domain: general, level: easy, text: "週末におすすめの気分転換の方法を教えて"}
+  # ---- general: medium ----
+  - {domain: general, level: medium, text: "老後の資産形成について、投資初心者向けに要点を整理して教えてください"}
+  - {domain: general, level: medium, text: "日本の少子化が進む主な要因を3つ挙げて、それぞれ簡単に説明してください"}
+  - {domain: general, level: medium, text: "再生可能エネルギーのメリットとデメリットを比較して整理してください"}
+  - {domain: general, level: medium, text: "リモートワークとオフィス出社、それぞれの生産性への影響を論じてください"}
+  - {domain: general, level: medium, text: "健康的な食生活を無理なく続けるための工夫をいくつか提案してください"}
+  # ---- general: hard ----
+  - {domain: general, level: hard, text: "リーマン予想がなぜ数学的に重要なのか、その背景と長年未解決である理由を論じてください"}
+  - {domain: general, level: hard, text: "円安が日本の輸出企業と一般家庭に与える影響を、短期と長期の両面から分析してください"}
+  - {domain: general, level: hard, text: "特殊相対性理論で同時性が観測者ごとに異なる理由を、思考実験を使って厳密に説明してください"}
+  - {domain: general, level: hard, text: "ある臨床試験データの統計的有意性の解釈と、見落とされがちな交絡因子の可能性を批判的に検討してください"}
+  - {domain: general, level: hard, text: "下請けへの一方的な取引条件変更が独占禁止法上の優越的地位の濫用に当たるか、多角的に検討してください"}
+  - {domain: general, level: hard, text: "ベイズ統計と頻度論統計の哲学的前提の違いを、具体例を交えて論じてください"}
+  - {domain: general, level: hard, text: "中央銀行の量的緩和が長期金利と資産価格に及ぼす波及経路を、メカニズムに分けて論じてください"}
+  # ---- coding: easy ----
+  - {domain: coding, level: easy, text: "Pythonでリストを逆順にする方法を教えて"}
+  - {domain: coding, level: easy, text: "gitで直前のコミットメッセージを修正するコマンドは何ですか"}
+  - {domain: coding, level: easy, text: "JavaScriptで現在の日時を取得する書き方を教えて"}
+  - {domain: coding, level: easy, text: "bashでカレントディレクトリのファイル数を数えるには？"}
+  # ---- coding: medium ----
+  - {domain: coding, level: medium, text: "この関数にユニットテストを書いてください： def add(a, b): return a + b"}
+  - {domain: coding, level: medium, text: "REST APIとGraphQLの違いを、実装や運用の観点から説明してください"}
+  - {domain: coding, level: medium, text: "SQLでN+1問題が起きる原因と、一般的な対策を教えてください"}
+  - {domain: coding, level: medium, text: "ReactのuseEffectの依存配列の指定を間違えるとどんな不具合が起きるか説明してください"}
+  - {domain: coding, level: medium, text: "Dockerイメージのサイズを小さくするための実践的なテクニックを教えてください"}
+  # ---- coding: hard ----
+  - {domain: coding, level: hard, text: "複数のマイクロサービスにまたがって断続的に発生するレイテンシスパイクを、分散トレーシングでどう切り分けるか調査手順を設計してください"}
+  - {domain: coding, level: hard, text: "高トラフィックなイベント駆動システムで、メッセージの重複処理防止と順序保証を両立させるアーキテクチャを設計してください"}
+  - {domain: coding, level: hard, text: "本番環境でのみ再現するデッドロックについて、スレッドダンプとロック取得順序から原因を特定し修正方針を立ててください"}
+  - {domain: coding, level: hard, text: "KubernetesクラスタでPodが断続的にOOMKilledされる問題の、原因調査の手順と恒久対策を提案してください"}
+  - domain: coding
+    level: hard
+    text: |
+      以下のスタックトレースからNullPointerExceptionの根本原因を特定し、修正方針を示してください
+      ```
+      java.lang.NullPointerException
+        at com.example.OrderService.process(OrderService.java:42)
+        at com.example.Main.run(Main.java:17)
+      ```
+  - {domain: coding, level: hard, text: "PostgreSQLで特定のクエリだけ実行計画が突然悪化する現象について、原因の切り分けと恒久対策を検討してください"}
