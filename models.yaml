@@ -70,7 +70,7 @@
 # target and is intentionally omitted here.
 
 models:
-  - model: gpt-5.5
+  - model: gpt-5.6-sol
     description: "雑談・日常会話・質問応答。文章作成・要約・翻訳・校正・タイトル作成。数学や論理を含む一般的な推論、時事や雑学の相談、旅行・レシピ・買い物などの相談ごと。"
     task_examples:
       - "今日の天気について雑談したい"
@@ -141,6 +141,30 @@ models:
     supports_tools: true
     is_local: true
     fallback_chain: []
+
+  - model: claude-opus-4-8
+    description: "ソフトウェア開発・プログラミング全般。コード生成・コードレビュー・リファクタリング・デバッグ・バグ修正。システムやアーキテクチャの技術設計、インフラ運用・CI/CD・障害調査、ライブラリやAPIの使い方相談。"
+    task_examples:
+      - "このコードのバグを直してほしい"
+      - "この関数をレビューしてほしい"
+      - "システムのアーキテクチャ設計についてアドバイスがほしい"
+      - "CI/CDパイプラインの障害を調査してほしい"
+      - "このライブラリの使い方を教えてほしい"
+      - "このコードをリファクタリングしてほしい"
+      - "デプロイの自動化スクリプトを書いてほしい"
+      - "新しい機能を実装するコードを書いてほしい"
+      - "このコードのテストコードを書いてほしい"
+      - "SQLクエリの書き方やデータベース設計を手伝ってほしい"
+      - "このプログラムの処理速度を最適化してほしい"
+      - "実行時に出るエラーの原因を調査して修正してほしい"
+      - "CSVデータを集計するスクリプトを書いてほしい"
+    cost: 5
+    tier: 6
+    context_window: 262144
+    multimodal: false
+    supports_tools: true
+    is_local: false
+    fallback_chain: [bbrfkr-llm-coding]
 
   - model: claude-sonnet-5
     description: "ソフトウェア開発・プログラミング全般。コード生成・コードレビュー・リファクタリング・デバッグ・バグ修正。システムやアーキテクチャの技術設計、インフラ運用・CI/CD・障害調査、ライブラリやAPIの使い方相談。"
